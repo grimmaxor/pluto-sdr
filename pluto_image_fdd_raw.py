@@ -3,6 +3,8 @@ ADALM Pluto — FDD RAW Image Transfer (uncompressed, unlimited size, BPSK)
 ========================================================================
 A dedicated one-way image link with a reverse control channel, pure Python.
 
+Canonical source: https://github.com/grimmaxor/pluto-sdr
+
   Pluto 1 (image SENDER) : python pluto_image_fdd_raw.py --role tx --image photo.jpg
   Pluto 2 (image RECEIVER): python pluto_image_fdd_raw.py --role rx --out-dir ./received
 
