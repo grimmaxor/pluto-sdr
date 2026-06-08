@@ -802,12 +802,16 @@ def sender_main(sdr):
             if advanced:
                 break
             if not to_send:
+                # No REQ and no BACK heard — receiver missed the data entirely.
+                # Re-queue the full block so the next iteration retransmits all
+                # packets rather than just re-sending EOR into silence.
                 if time.time() - t_block > 4 * WAIT_TIMEOUT:
                     print(f"\n[TX] Block {blk} stalled — re-broadcasting META.")
                     with sdr_lock:
                         tx_set(sdr, meta_pkt)
                     time.sleep(1.0)
                     t_block = time.time()
+                to_send = list(range(lo, hi))
                 continue
 
     print("\n[TX] All blocks sent. Waiting for final DONE ...")
