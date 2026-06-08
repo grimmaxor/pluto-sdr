@@ -125,7 +125,7 @@ GAIN_RETRIES       = 8             # whole-sweep retries if partner not heard ye
 POWER_ROUNDS       = 6             # status exchanges per TX-power step
 POWER_MARGIN       = 5             # extra dB of power (less atten) for stability
 READY_ROUNDS       = 40            # link-confirm exchanges
-TX_ATTEN_SWEEP     = list(range(-80, 1, 5))   # weak -> strong
+TX_ATTEN_SWEEP     = list(range(-40, 1, 5))   # weak -> strong
 
 # Timing
 TX_PACKET_BURST    = 0.30            # seconds each DATA packet stays on air
@@ -505,7 +505,7 @@ def calibrate_rx_gain(sdr, label):
     set_tx_atten(sdr, CAL_TX_ATTEN)
     tx_set(sdr, build_packet(PKT_CAL_TONE, 0, 0))      # beacon for the partner
     lo, hi = rx_gain_limits(sdr)
-    sweep  = list(range(int(np.ceil(lo)), int(np.floor(hi)) + 1, 3))
+    sweep  = list(range(max(30, int(np.ceil(lo))), int(np.floor(hi)) + 1, 3))
     print(f"[{label}] Valid RX gain: {lo:.0f}..{hi:.0f} dB")
     for attempt in range(GAIN_RETRIES):
         g = find_rx_gain(sdr, label, sweep)
