@@ -829,16 +829,24 @@ def receiver_main(sdr):
     # blocking the background listener from calling sdr.rx() and causing DATA
     # packets to be missed. Discard them now — they are useless once we have
     # sent GO and are in receive mode.
-    stale = 0
+    # IMPORTANT: do a single-pass snapshot drain, NOT a loop that puts items
+    # back and re-reads them — putting non-META items back inside the loop
+    # causes an infinite loop whenever any DATA packets are already in the queue.
+    _snap = []
     while True:
         try:
-            peek = frame_q.get_nowait()
+            _snap.append(frame_q.get_nowait())
         except queue.Empty:
             break
-        if peek['type'] != PKT_META:
-            frame_q.put_nowait(peek)   # put non-META back
-        else:
+    stale = 0
+    for _item in _snap:
+        if _item['type'] == PKT_META:
             stale += 1
+        else:
+            try:
+                frame_q.put_nowait(_item)
+            except queue.Full:
+                pass
     if stale:
         print(f"[RX] Discarded {stale} stale META packet(s) from queue before block loop")
     # ─────────────────────────────────────────────────────────────────────────
