@@ -583,12 +583,16 @@ def _cal_phase_sweeper(sdr, phase, label):
     set_rx_gain(sdr, rx_gain)
     print(f"  [{label}] {ch} RX gain = {rx_gain} dB")
 
+    # The feedback channel (our TX) may not be calibrated yet — transmit at max
+    # power so the leader can reliably decode our rxok responses.
+    set_tx_atten(sdr, 0)
+
     # Signal to the leader that gain is locked → it will start the power sweep.
     tx_set(sdr, build_packet(PKT_CAL_STAT, 0, phase, encode_status(1, 0, 0)))
 
     # Respond to the leader's power sweep: echo rxok=1 for every CAL_STAT we decode.
     # Exit early if we receive PKT_CAL_NEXT (leader done with power negotiation).
-    print(f"  [{label}] Responding to {ch} TX power sweep ...")
+    print(f"  [{label}] Responding to {ch} TX power sweep at max power (feedback channel uncalibrated) ...")
     t_end = time.time() + CAL_PHASE_SWEEPER_RESP
     while time.time() < t_end:
         pkts = cal_rx_packets(sdr)
