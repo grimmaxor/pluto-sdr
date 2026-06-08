@@ -1,9 +1,9 @@
 """
-ADALM Pluto — FDD RAW Image Transfer  (Option-C combined calibration)
-======================================================================
-Identical to pluto_image_fdd_raw.py except the two-phase calibration
-(separate RX-gain sweep + TX-power sweep) is replaced with a single
-combined sweep that finds the optimal (rx_gain, tx_atten) pair together.
+ADALM Pluto — FDD RAW Image Transfer  (Option-B escalating calibration)
+========================================================================
+Identical to pluto_image_fdd_raw.py except the calibration is changed to
+fix the silent failure that occurs when the link is too weak for the
+original fixed-power gain sweep.
 
 WHY THE ORIGINAL TWO-PHASE CAL FAILS
 --------------------------------------
@@ -13,17 +13,31 @@ falls back to the default rx_gain.  Phase 2 then sweeps TX power with
 the wrong RX gain set, so it never decodes the partner's status frames
 either — both phases fail silently.
 
-OPTION C: COMBINED 2-D SWEEP
------------------------------
-Sweeps TX attenuation weak→strong (same direction as the old Phase 2).
-At each attenuation step:
-  1. Fast scan (CAL_SCAN_BUFS=2 captures) across a coarser gain grid
-     to quickly reject power levels where no signal is present.
-  2. Full gain sweep (GAIN_STEP_BUFS captures, full resolution) only at
-     the first power level where the fast scan heard anything.
-Stops at the first (tx_atten, rx_gain) pair that passes the full sweep
-— this is the minimum TX power at which the link works, with the correct
-RX gain calibrated at that actual power level.
+WHY OPTION C (combined 2-D sweep) ALSO FAILS
+---------------------------------------------
+In symmetric FDD, both radios run the calibration loop simultaneously.
+Option C changes TX attenuation at the end of each gain sweep, but the
+gain sweep at a failing (no-signal) power level completes near-instantly
+while a passing level takes much longer.  This causes the two radios to
+drift out of phase — one radio is already at -45 dB while the other is
+still finishing its sweep at -55 dB, so neither hears the other.
+
+OPTION B: ESCALATING TX POWER, SAME TWO-PHASE STRUCTURE
+---------------------------------------------------------
+Keeps the original two-phase structure so both radios stay in the same
+phase at the same time (both always in gain-sweep phase, then both always
+in TX-power negotiation phase).
+
+Phase 1 — RX gain sweep with escalating TX power:
+  Start beaconing at CAL_TX_ATTEN (-30 dB) and run the full gain sweep.
+  If no gain step decodes, increase TX power by CAL_POWER_STEP (5 dB) and
+  retry — repeating until the sweep succeeds or max power (0 dB) is hit.
+  Because both radios follow the same escalation schedule and each step
+  takes roughly equal time, they stay synchronised.
+
+Phase 2 — TX power negotiation (unchanged from original):
+  Now that RX gain is correctly set, sweep TX attenuation weak→strong
+  and find the minimum power the partner can hear.
 
 Usage (same as pluto_image_fdd_raw.py):
   Pluto 1 (sender):   python pluto_image_fdd_raw_cal.py --role tx --image photo.jpg
@@ -90,11 +104,12 @@ BLOCK_CHUNKS    = 200
 MAX_REQ_SEQS    = 50
 
 # Calibration constants
-CAL_SCAN_BUFS   = 2    # fast captures per gain step during TX-power scan
-GAIN_STEP_BUFS  = 6    # full captures per gain step during the winning power's sweep
-GAIN_CONFIRM    = 2    # decodes needed to accept a gain step (full sweep)
-SCAN_CONFIRM    = 1    # decodes needed during fast scan
-POWER_MARGIN    = 5    # extra dB of power (less atten) added after finding minimum
+CAL_TX_ATTEN    = -30  # starting TX power for the gain sweep
+CAL_POWER_STEP  = 5    # dB to increase TX power on each escalation retry
+GAIN_STEP_BUFS  = 6    # rx() captures per gain step
+GAIN_CONFIRM    = 2    # decodes needed to accept a gain step
+POWER_ROUNDS    = 6    # status exchanges per TX-power step
+POWER_MARGIN    = 5    # extra dB of power (less atten) for stability
 READY_ROUNDS    = 40
 TX_ATTEN_SWEEP  = list(range(-80, 1, 5))   # weak -> strong
 
@@ -361,7 +376,7 @@ def print_progress(done, total, label, extra=""):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  OPTION-C CALIBRATION
+#  OPTION-B CALIBRATION  (escalating TX power, original two-phase structure)
 # ═══════════════════════════════════════════════════════════════════════════════
 def set_rx_gain(sdr, g): sdr.rx_hardwaregain_chan0 = int(g)
 def set_tx_atten(sdr, a): sdr.tx_hardwaregain_chan0 = int(a)
@@ -387,165 +402,145 @@ def flush_rx(sdr, n=1):
             pass
 
 
-def _gain_sweep(sdr, gain_sweep, n_bufs, confirm):
-    """
-    Sweep gain steps, collecting n_bufs captures each.
-    Returns best gain (highest decode rate, not clipping) or None.
-    """
+def cal_rx_packets(sdr):
+    try:
+        return iq_to_packets(sdr.rx())
+    except Exception:
+        return []
+
+
+def find_rx_gain(sdr, label, sweep):
+    """Sweep RX gain against the partner's beacon; pick the best non-clipping step."""
+    print(f"\n[{label}] Sweeping RX gain ...")
+    print(f"  {'Gain':>5}  {'Peak':>6}  {'ADC%':>5}  {'Decodes':>7}")
     candidates = []
-    for g in gain_sweep:
+    for g in sweep:
         try:
             set_rx_gain(sdr, g)
         except OSError:
             continue
-        time.sleep(0.05)
-        flush_rx(sdr, 1)
+        time.sleep(0.1); flush_rx(sdr, 1)
         dec = pk = 0
-        for _ in range(n_bufs):
+        for _ in range(GAIN_STEP_BUFS):
             try:
-                rx = sdr.rx()
-                pk = max(pk, np.max(np.abs(rx)))
+                rx = sdr.rx(); pk = max(pk, np.max(np.abs(rx)))
                 if iq_to_packets(rx):
                     dec += 1
             except Exception:
                 pass
         adc = pk / 2896 * 100
+        print(f"  {g:>5}  {pk:>6.0f}  {adc:>4.0f}%  {dec:>7}")
         if adc > 98:
             continue
-        if dec >= confirm:
+        if dec >= GAIN_CONFIRM:
             candidates.append((dec - abs(adc - 60) / 100.0, g, adc, dec))
     if not candidates:
         return None
     candidates.sort(reverse=True)
-    return candidates[0][1]
+    _, g, adc, dec = candidates[0]
+    print(f"[{label}] ✓ RX gain = {g} dB  (ADC {adc:.0f}%, {dec}/{GAIN_STEP_BUFS} decodes)")
+    return g
+
+
+def calibrate_rx_gain(sdr, label):
+    """
+    Phase 1: RX gain sweep with escalating TX power.
+
+    Starts beaconing at CAL_TX_ATTEN and runs the full gain sweep.  If no
+    gain step decodes (partner not heard), increases TX power by CAL_POWER_STEP
+    and retries.  Because both radios follow the same escalation schedule and
+    each step takes roughly equal time, they stay synchronised.
+    """
+    lo, hi = rx_gain_limits(sdr)
+    sweep  = list(range(int(np.ceil(lo)), int(np.floor(hi)) + 1, 3))
+    print(f"[{label}] Valid RX gain: {lo:.0f}..{hi:.0f} dB")
+
+    # Escalation ladder: CAL_TX_ATTEN -> 0 dB in CAL_POWER_STEP increments.
+    power_steps = list(range(CAL_TX_ATTEN, 1, CAL_POWER_STEP))
+
+    for atten in power_steps:
+        set_tx_atten(sdr, atten)
+        tx_set(sdr, build_packet(PKT_CAL_TONE, 0, 0))
+        print(f"\n[{label}] Phase 1 — TX atten {atten} dB, sweeping RX gain ...")
+        g = find_rx_gain(sdr, label, sweep)
+        if g is not None:
+            set_rx_gain(sdr, g)
+            return g
+        print(f"[{label}] Partner not heard at {atten} dB — increasing TX power")
+
+    fb = int(np.clip(args.rx_gain, np.ceil(lo), np.floor(hi)))
+    print(f"[{label}] Gain sweep failed at all power levels — "
+          f"falling back to RX gain {fb} dB")
+    set_rx_gain(sdr, fb)
+    return fb
+
+
+def calibrate_tx_power(sdr, label):
+    """Phase 2: TX power negotiation — unchanged from pluto_image_fdd_raw.py."""
+    print(f"\n[{label}] Phase 2 — Negotiating TX power (weak -> strong) ...")
+    my_rxok = 1; advertised = None; chosen = None
+
+    def advertise(atten):
+        nonlocal advertised
+        key = (my_rxok, atten)
+        if key != advertised:
+            tx_set(sdr, build_packet(PKT_CAL_STAT, 0, 0,
+                                     encode_status(my_rxok, atten, 0)))
+            advertised = key
+
+    for atten in TX_ATTEN_SWEEP:
+        set_tx_atten(sdr, atten); advertise(atten); ok = False
+        for _ in range(POWER_ROUNDS):
+            st = None
+            for pkt in cal_rx_packets(sdr):
+                if pkt['type'] == PKT_CAL_STAT:
+                    st = decode_status(pkt['payload'])
+            if st:
+                my_rxok = 1; advertise(atten); ok = (st['rxok'] == 1)
+            else:
+                my_rxok = 0; advertise(atten)
+            if ok:
+                break
+        print(f"  TX atten {atten:>4} dB -> {'partner hears us' if ok else 'no echo'}")
+        if ok:
+            chosen = atten; break
+
+    chosen = min(0, (chosen if chosen is not None else 0) + POWER_MARGIN)
+    set_tx_atten(sdr, chosen)
+    print(f"[{label}] ✓ TX atten = {chosen} dB")
+    return chosen
+
+
+def confirm_link(sdr, label, atten):
+    print(f"\n[{label}] Confirming link ...")
+    tx_set(sdr, build_packet(PKT_CAL_STAT, 0, 0, encode_status(1, atten, 1)))
+    for _ in range(READY_ROUNDS):
+        for pkt in cal_rx_packets(sdr):
+            if pkt['type'] == PKT_CAL_STAT:
+                st = decode_status(pkt['payload'])
+                if st and st['ready']:
+                    print(f"[{label}] ✓ Link confirmed both ways!")
+                    return
+    print(f"[{label}] Partner-ready not seen — continuing anyway.")
 
 
 def calibrate(sdr, label):
-    """
-    Option C: combined TX-attenuation + RX-gain sweep.
-
-    For each TX attenuation level (weak -> strong):
-      1. Fast scan (CAL_SCAN_BUFS, coarse gain grid) — quickly skip power
-         levels where no signal is present at any gain.
-      2. Full sweep (GAIN_STEP_BUFS, fine gain grid) — only runs at the
-         first power level the fast scan passes.
-
-    Stops at the first (tx_atten, rx_gain) pair where the full sweep
-    succeeds.  This is the minimum TX power for which the link works,
-    with the RX gain calibrated at that actual power level.
-    """
     print(f"\n{'='*60}")
-    print(f"  ROLE {label} — Option-C combined calibration")
-    print(f"  TX sweep: {TX_ATTEN_SWEEP[0]} -> {TX_ATTEN_SWEEP[-1]} dB  "
-          f"(fast scan then full sweep)")
+    print(f"  ROLE {label} — Option-B escalating calibration")
+    print(f"  Phase 1: RX gain sweep, TX escalates "
+          f"{CAL_TX_ATTEN} -> 0 dB in {CAL_POWER_STEP} dB steps")
+    print(f"  Phase 2: TX power negotiation (weak -> strong)")
     print(f"{'='*60}")
-
-    lo, hi = rx_gain_limits(sdr)
-    fine_sweep   = list(range(int(np.ceil(lo)),  int(np.floor(hi)) + 1, 3))
-    coarse_sweep = fine_sweep[::3]   # every 3rd step for fast scan
-    print(f"[{label}] RX gain range: {lo:.0f}..{hi:.0f} dB  "
-          f"({len(fine_sweep)} fine / {len(coarse_sweep)} coarse steps)")
-
-    found_rx_gain  = None
-    found_tx_atten = None
-
-    for atten in TX_ATTEN_SWEEP:
-        set_tx_atten(sdr, atten)
-        tx_set(sdr, build_packet(PKT_CAL_TONE, 0, 0))
-        time.sleep(0.15)
-        flush_rx(sdr, 1)
-
-        # ── Fast scan: coarse gain grid, minimal captures ──
-        g_fast = _gain_sweep(sdr, coarse_sweep, CAL_SCAN_BUFS, SCAN_CONFIRM)
-        sys.stdout.write(f"  atten {atten:>4} dB  fast-scan: "
-                         f"{'signal at ~' + str(g_fast) + ' dB' if g_fast is not None else 'no signal'}\n")
-        sys.stdout.flush()
-
-        if g_fast is None:
-            continue   # no signal at this power level — step up TX power
-
-        # ── Full sweep: fine gain grid, full capture count ──
-        print(f"  atten {atten:>4} dB  full sweep ...")
-        print(f"  {'Gain':>5}  {'Peak':>6}  {'ADC%':>5}  {'Decodes':>7}")
-
-        candidates = []
-        for g in fine_sweep:
-            try:
-                set_rx_gain(sdr, g)
-            except OSError:
-                continue
-            time.sleep(0.05)
-            flush_rx(sdr, 1)
-            dec = pk = 0
-            for _ in range(GAIN_STEP_BUFS):
-                try:
-                    rx = sdr.rx()
-                    pk = max(pk, np.max(np.abs(rx)))
-                    if iq_to_packets(rx):
-                        dec += 1
-                except Exception:
-                    pass
-            adc = pk / 2896 * 100
-            print(f"  {g:>5}  {pk:>6.0f}  {adc:>4.0f}%  {dec:>7}")
-            if adc > 98:
-                continue
-            if dec >= GAIN_CONFIRM:
-                candidates.append((dec - abs(adc - 60) / 100.0, g, adc, dec))
-
-        if candidates:
-            candidates.sort(reverse=True)
-            _, best_g, best_adc, best_dec = candidates[0]
-            print(f"  [✓] TX atten {atten} dB  RX gain {best_g} dB  "
-                  f"ADC {best_adc:.0f}%  {best_dec}/{GAIN_STEP_BUFS} decodes")
-            found_rx_gain  = best_g
-            found_tx_atten = atten
-            break
-
-        # Fast scan passed but full sweep didn't — signal was marginal.
-        # Don't break; continue to next (stronger) TX attenuation step.
-        print(f"  Full sweep found nothing at atten {atten} dB — stepping up power")
-
-    if found_rx_gain is None:
-        fb_gain  = int(np.clip(args.rx_gain, np.ceil(lo), np.floor(hi)))
-        fb_atten = 0
-        print(f"\n[{label}] Calibration failed — falling back to "
-              f"RX gain {fb_gain} dB, TX atten {fb_atten} dB")
-        found_rx_gain  = fb_gain
-        found_tx_atten = fb_atten
-    else:
-        # Add stability margin so we're not operating right at the edge.
-        found_tx_atten = min(0, found_tx_atten + POWER_MARGIN)
-
-    set_rx_gain(sdr, found_rx_gain)
-    set_tx_atten(sdr, found_tx_atten)
-
-    # Confirm both directions are up.
-    print(f"\n[{label}] Confirming link ...")
-    tx_set(sdr, build_packet(PKT_CAL_STAT, 0, 0, encode_status(1, found_tx_atten, 1)))
-    for _ in range(READY_ROUNDS):
-        try:
-            for pkt in iq_to_packets(sdr.rx()):
-                if pkt['type'] == PKT_CAL_STAT:
-                    st = decode_status(pkt['payload'])
-                    if st and st['ready']:
-                        print(f"[{label}] ✓ Link confirmed both ways!")
-                        break
-            else:
-                continue
-            break
-        except Exception:
-            pass
-    else:
-        print(f"[{label}] Partner-ready not seen — continuing anyway.")
-
+    rx_gain  = calibrate_rx_gain(sdr, label)
+    tx_atten = calibrate_tx_power(sdr, label)
+    confirm_link(sdr, label, tx_atten)
     print(f"\n{'='*60}")
     print(f"  CALIBRATION COMPLETE")
-    print(f"  RX gain  : {found_rx_gain} dB")
-    print(f"  TX atten : {found_tx_atten} dB  (includes +{POWER_MARGIN} dB margin)")
-    print(f"  Use --skip-cal --rx-gain {found_rx_gain} --tx-atten {found_tx_atten} "
-          f"to skip next time")
+    print(f"  RX gain  : {rx_gain} dB")
+    print(f"  TX atten : {tx_atten} dB")
+    print(f"  Use --skip-cal --rx-gain {rx_gain} --tx-atten {tx_atten} to skip next time")
     print(f"{'='*60}\n")
-    return found_rx_gain, found_tx_atten
+    return rx_gain, tx_atten
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
