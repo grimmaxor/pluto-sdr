@@ -98,8 +98,7 @@ _PUNCT_PERIOD = 7
 _RS_NSYM    = 16
 _RS_PAD     = 51           # RS(255,239) → RS(204,188): 255-204 = 51 pad bytes
 _RS_PRIM    = 0x11d        # primitive polynomial x^8+x^4+x^3+x^2+1
-_rs_codec   = RSCodec(nsym=_RS_NSYM, nroots=_RS_NSYM, prim=_RS_PRIM,
-                      generator=2, fcr=0, c_exp=8)
+_rs_codec   = RSCodec(nsym=_RS_NSYM, prim=_RS_PRIM, generator=2, fcr=0, c_exp=8)
 
 # Pilot amplitude boost (4/3 relative to unit-power data)
 _PILOT_BOOST = 4.0 / 3.0
