@@ -30,6 +30,10 @@ Usage:
   python pluto_dvbt2.py --rx [--freq 2.4e9] [--uri ip:192.168.2.1] [--gain 30]
                         [--save out.ts]
 
+  Both sides auto-calibrate before streaming (BPSK symmetric FDD handshake).
+  TX beacons on --freq; RX uses freq+2 MHz as its return channel.
+  Skip calibration and hard-code values with --skip-cal --gain N --attn N.
+
 Dependencies:
   pip install pyadi-iio numpy scipy reedsolo pylibiio
   GStreamer (gst-launch-1.0) on PATH
@@ -48,6 +52,9 @@ import subprocess
 import sys
 import threading
 import time
+import zlib
+
+from scipy.signal import firwin, lfilter as _lfilter
 
 import numpy as np
 from reedsolo import RSCodec
@@ -816,6 +823,316 @@ def _run_gst(cmd, stop_evt):
                 return
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Auto-calibration  (BPSK symmetric FDD, runs before DVB-T stream)
+# ══════════════════════════════════════════════════════════════════════════════
+#
+# Both sides run calibrate_dvbt() simultaneously before streaming.
+# TX Pluto: TX on --freq, RX on (freq + _CAL_OFFSET)  — calibration return channel.
+# RX Pluto: TX on (freq + _CAL_OFFSET),  RX on --freq.
+# The offset keeps the two calibration directions on separate carriers so neither
+# Pluto's own TX swamps its own RX input.
+#
+# After calibration the Pluto is deleted and reconfigured at 3.2 MSPS for DVB-T.
+# Only the value each role actually uses is kept:
+#   TX role → uses calibrated tx_atten  (never RX's in DVB-T)
+#   RX role → uses calibrated rx_gain   (never TX's in DVB-T)
+
+_CAL_OFFSET      = 2_000_000    # Hz separation between cal TX and cal RX
+_CAL_SRATE       = 1_000_000
+_CAL_SPS         = 16
+_CAL_BUF_TX      = 65536
+_CAL_BUF_RX      = 262144
+_CAL_TX_ATTEN    = -30          # TX power during RX gain sweep
+_CAL_GAIN_STEP   = 3
+_CAL_STEP_BUFS   = 6
+_CAL_CONFIRM     = 2
+_CAL_RETRIES     = 8
+_CAL_PWR_ROUNDS  = 6
+_CAL_PWR_MARGIN  = 5
+_CAL_READY_RNDS  = 40
+_CAL_ATTEN_SWEEP = list(range(-40, 1, 5))
+_CAL_MAGIC       = 0xC5
+_CAL_PKT_TONE    = 0x20
+_CAL_PKT_STAT    = 0x21
+
+_CAL_BARKER = np.array([1, 1, 1, 1, 1, -1, -1, 1, 1, -1, 1, -1, 1], dtype=np.float32)
+_CAL_PRE    = np.tile(_CAL_BARKER, 3).astype(np.float32)
+_CAL_PLEN   = len(_CAL_PRE)
+_CAL_FILT   = firwin(_CAL_SPS * 4 + 1, 1.4 / _CAL_SPS, window='hamming').astype(np.float32)
+
+
+def _cbuild(ptype, payload=b''):
+    hdr  = struct.pack('>BBIIH', _CAL_MAGIC, ptype, 0, 0, len(payload))
+    body = hdr + payload
+    return body + struct.pack('>I', zlib.crc32(body) & 0xFFFFFFFF)
+
+
+def _cparse(raw):
+    HDR = 12
+    if len(raw) < HDR + 4:
+        return None
+    mg, pt, sq, tot, plen = struct.unpack('>BBIIH', raw[:HDR])
+    if mg != _CAL_MAGIC or plen > 256 or HDR + plen + 4 > len(raw):
+        return None
+    payload = raw[HDR:HDR + plen]
+    crc_rx  = struct.unpack('>I', raw[HDR + plen:HDR + plen + 4])[0]
+    if (zlib.crc32(raw[:HDR + plen]) & 0xFFFFFFFF) != crc_rx:
+        return None
+    return {'type': pt, 'payload': payload}
+
+
+def _c_pkt_to_iq(pkt_bytes):
+    pbits  = np.unpackbits(np.frombuffer(pkt_bytes, dtype=np.uint8))
+    bpsk   = (1.0 - 2.0 * pbits.astype(np.float32))
+    syms   = np.concatenate([_CAL_PRE, bpsk]).astype(np.complex64)
+    up     = np.zeros(len(syms) * _CAL_SPS, dtype=np.complex64)
+    up[::_CAL_SPS] = syms
+    shaped = _lfilter(_CAL_FILT, 1.0, up.real).astype(np.float32).astype(np.complex64)
+    mx = np.max(np.abs(shaped))
+    if mx > 0:
+        shaped = shaped / mx * 0.8 * 2**15
+    plen = len(shaped)
+    if plen >= _CAL_BUF_TX:
+        return shaped[:_CAL_BUF_TX].astype(np.complex64)
+    body = np.tile(shaped, _CAL_BUF_TX // plen)
+    pad  = np.zeros(_CAL_BUF_TX - len(body), dtype=np.complex64)
+    return np.concatenate([body, pad]).astype(np.complex64)
+
+
+def _c_iq_to_pkts(iq):
+    if np.max(np.abs(iq)) < 5:
+        return []
+    iq    = (iq / np.max(np.abs(iq))).astype(np.complex64)
+    delay = len(_CAL_FILT) // 2
+    found = {}
+
+    variants = [iq]
+    sq   = iq ** 2
+    fv   = np.fft.fft(sq); fv[0] = 0
+    cfo  = np.fft.fftfreq(len(sq), d=1.0 / _CAL_SRATE)[int(np.argmax(np.abs(fv)))] / 2
+    if abs(cfo) > 50:
+        t = np.arange(len(iq)) / _CAL_SRATE
+        variants.append((iq * np.exp(-1j * 2 * np.pi * cfo * t)).astype(np.complex64))
+
+    for v in variants:
+        filt = _lfilter(_CAL_FILT, 1.0, v.real).astype(np.float32).astype(np.complex64)
+        for toff in range(_CAL_SPS):
+            stream = filt[(delay + toff) % _CAL_SPS::_CAL_SPS]
+            if len(stream) < _CAL_PLEN + 32:
+                continue
+            corr = np.correlate(np.sign(stream.real).astype(np.float32),
+                                _CAL_PRE, mode='valid')
+            for c in np.where(np.abs(corr) > _CAL_PLEN * 0.8)[0]:
+                inv = corr[c] < 0
+                for slip in (0, 1, -1, 2, -2):
+                    ds_start = c + _CAL_PLEN + slip
+                    if ds_start < 0 or ds_start >= len(stream):
+                        continue
+                    ds   = stream[ds_start:]
+                    bits = ((-ds.real if inv else ds.real) < 0).astype(np.uint8)
+                    nb   = len(bits) // 8
+                    if nb < 16:
+                        continue
+                    pkt = _cparse(bytes(np.packbits(bits[:nb * 8])))
+                    if pkt:
+                        found[(pkt['type'],)] = pkt
+                        break
+        if found:
+            break
+    return list(found.values())
+
+
+def _setup_cal_sdr(uri, tx_lo, rx_lo):
+    sdr = adi.Pluto(uri=uri)
+    sdr.sample_rate             = _CAL_SRATE
+    sdr.tx_rf_bandwidth         = _CAL_SRATE
+    sdr.rx_rf_bandwidth         = _CAL_SRATE
+    sdr.tx_lo                   = int(tx_lo)
+    sdr.rx_lo                   = int(rx_lo)
+    sdr.tx_hardwaregain_chan0   = _CAL_TX_ATTEN
+    sdr.gain_control_mode_chan0 = 'manual'
+    sdr.rx_hardwaregain_chan0   = 30
+    sdr.rx_buffer_size          = _CAL_BUF_RX
+    sdr.tx_cyclic_buffer        = True
+    sdr.tx_buffer_size          = _CAL_BUF_TX
+    sdr.tx_enabled_channels     = [0]
+    sdr.rx_enabled_channels     = [0]
+    _disable_dds(sdr)
+    return sdr
+
+
+def _cal_tx_set(sdr, pkt_bytes):
+    try:
+        sdr.tx_destroy_buffer()
+    except Exception:
+        pass
+    sdr.tx(_c_pkt_to_iq(pkt_bytes))
+
+
+def _cal_rx_gain_limits(sdr):
+    try:
+        ch   = sdr._ctrl.find_channel("voltage0", False)
+        nums = [float(x) for x in
+                ch.attrs["hardwaregain_available"].value.strip("[] ").split()]
+        if len(nums) == 3 and nums[2] > nums[0]:
+            return nums[0], nums[2]
+    except Exception:
+        pass
+    return 0.0, 71.0
+
+
+def _cal_flush(sdr, n=2):
+    for _ in range(n):
+        try:
+            sdr.rx()
+        except Exception:
+            pass
+
+
+def _cal_sweep_gain(sdr, label, sweep):
+    print(f"  {'Gain':>5}  {'Peak':>6}  {'ADC%':>5}  {'Dec':>4}")
+    candidates = []
+    for g in sweep:
+        try:
+            sdr.rx_hardwaregain_chan0 = int(g)
+        except OSError:
+            continue
+        time.sleep(0.1)
+        _cal_flush(sdr, 1)
+        dec = pk = 0
+        for _ in range(_CAL_STEP_BUFS):
+            try:
+                rx = sdr.rx()
+                pk = max(pk, np.max(np.abs(rx)))
+                if _c_iq_to_pkts(rx):
+                    dec += 1
+            except Exception:
+                pass
+        adc = pk / 2896 * 100
+        print(f"  {g:>5}  {pk:>6.0f}  {adc:>4.0f}%  {dec:>4}")
+        if adc > 98:
+            continue
+        if dec >= _CAL_CONFIRM:
+            candidates.append((dec - abs(adc - 60) / 100.0, g, adc, dec))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    _, g, adc, dec = candidates[0]
+    print(f"[{label}] RX gain = {g} dB  (ADC {adc:.0f}%, {dec}/{_CAL_STEP_BUFS})")
+    return g
+
+
+def _cal_phase_rx_gain(sdr, label):
+    sdr.tx_hardwaregain_chan0 = _CAL_TX_ATTEN
+    _cal_tx_set(sdr, _cbuild(_CAL_PKT_TONE))
+    lo, hi  = _cal_rx_gain_limits(sdr)
+    sweep   = list(range(int(np.ceil(lo)), int(np.floor(hi)) + 1, _CAL_GAIN_STEP))
+    print(f"[{label}] Sweeping RX gain {lo:.0f}..{hi:.0f} dB ...")
+    for attempt in range(_CAL_RETRIES):
+        g = _cal_sweep_gain(sdr, label, sweep)
+        if g is not None:
+            sdr.rx_hardwaregain_chan0 = int(g)
+            return g
+        print(f"[{label}] Not heard — retry {attempt + 1}/{_CAL_RETRIES}")
+    fb = 30
+    print(f"[{label}] Fallback RX gain {fb} dB")
+    sdr.rx_hardwaregain_chan0 = fb
+    return fb
+
+
+def _cal_phase_tx_power(sdr, label):
+    print(f"[{label}] Negotiating TX power (weak → strong) ...")
+    my_rxok    = 1
+    advertised = None
+    chosen     = None
+
+    def _advertise(atten):
+        nonlocal advertised
+        key = (my_rxok, atten)
+        if key != advertised:
+            _cal_tx_set(sdr, _cbuild(_CAL_PKT_STAT,
+                        payload=struct.pack('>bbb', int(my_rxok), int(atten), 0)))
+            advertised = key
+
+    for atten in _CAL_ATTEN_SWEEP:
+        sdr.tx_hardwaregain_chan0 = int(atten)
+        _advertise(atten)
+        ok = False
+        for _ in range(_CAL_PWR_ROUNDS):
+            st = None
+            try:
+                for pkt in _c_iq_to_pkts(sdr.rx()):
+                    if pkt['type'] == _CAL_PKT_STAT and len(pkt['payload']) >= 3:
+                        r, a, rd = struct.unpack('>bbb', pkt['payload'][:3])
+                        st = {'rxok': r, 'atten': a, 'ready': rd}
+            except Exception:
+                pass
+            if st:
+                my_rxok = 1; _advertise(atten); ok = (st['rxok'] == 1)
+            else:
+                my_rxok = 0; _advertise(atten)
+            if ok:
+                break
+        print(f"  atten {atten:>4} dB → {'✓ heard' if ok else '–'}")
+        if ok:
+            chosen = atten; break
+
+    chosen = min(0, (chosen if chosen is not None else 0) + _CAL_PWR_MARGIN)
+    sdr.tx_hardwaregain_chan0 = int(chosen)
+    print(f"[{label}] TX atten = {chosen} dB")
+    return chosen
+
+
+def _cal_confirm_link(sdr, label, atten):
+    print(f"[{label}] Confirming link ...")
+    _cal_tx_set(sdr, _cbuild(_CAL_PKT_STAT,
+                payload=struct.pack('>bbb', 1, int(atten), 1)))
+    for _ in range(_CAL_READY_RNDS):
+        try:
+            for pkt in _c_iq_to_pkts(sdr.rx()):
+                if pkt['type'] == _CAL_PKT_STAT and len(pkt['payload']) >= 3:
+                    _, _, rd = struct.unpack('>bbb', pkt['payload'][:3])
+                    if rd:
+                        print(f"[{label}] Link confirmed!")
+                        return
+        except Exception:
+            pass
+    print(f"[{label}] Partner-ready not seen — continuing.")
+
+
+def calibrate_dvbt(uri, freq, label):
+    """
+    BPSK auto-calibration before DVB-T streaming.
+    TX role: cal TX on freq,            cal RX on freq+CAL_OFFSET
+    RX role: cal TX on freq+CAL_OFFSET, cal RX on freq
+    Returns (rx_gain_db, tx_atten_db).
+    """
+    is_tx = (label == 'TX')
+    tx_lo = freq if is_tx else freq + _CAL_OFFSET
+    rx_lo = (freq + _CAL_OFFSET) if is_tx else freq
+
+    print(f"\n{'='*54}"
+          f"\n  {label} — auto-calibration"
+          f"\n  cal TX {tx_lo/1e6:.3f} MHz  |  cal RX {rx_lo/1e6:.3f} MHz"
+          f"\n{'='*54}")
+
+    sdr = _setup_cal_sdr(uri, tx_lo, rx_lo)
+    rx_gain  = _cal_phase_rx_gain(sdr, label)
+    tx_atten = _cal_phase_tx_power(sdr, label)
+    _cal_confirm_link(sdr, label, tx_atten)
+    print(f"\n[{label}] Calibration done — RX gain {rx_gain} dB, TX atten {tx_atten} dB")
+
+    _cal_flush(sdr, 3)
+    try:
+        sdr.tx_destroy_buffer()
+    except Exception:
+        pass
+    del sdr
+    time.sleep(1.0)
+    return rx_gain, tx_atten
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TX main loop
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -823,6 +1140,17 @@ def run_tx(args):
     is_win = platform.system() == 'Windows'
     device = args.device or ('0' if is_win else '/dev/video0')
     print(f"[TX] freq={args.freq/1e6:.1f} MHz  attn={args.attn} dB  uri={args.uri}")
+
+    # ── Calibration ───────────────────────────────────────────────────────────
+    if args.skip_cal:
+        tx_atten = args.attn
+        print(f"[TX] Skipping calibration — TX atten {tx_atten} dB")
+    else:
+        print("[TX] Starting calibration — launch the RX side now.  Beginning in 3 s ...")
+        time.sleep(3)
+        _, tx_atten = calibrate_dvbt(args.uri, args.freq, 'TX')
+        print(f"[TX] → reuse with --skip-cal --attn {tx_atten}")
+    # ─────────────────────────────────────────────────────────────────────────
 
     stop_evt = threading.Event()
 
@@ -833,7 +1161,7 @@ def run_tx(args):
     time.sleep(1.5)   # let GStreamer come up before opening radio
 
     # Open Pluto
-    sdr = setup_pluto_tx(args.uri, args.freq, args.attn)
+    sdr = setup_pluto_tx(args.uri, args.freq, tx_atten)
     print("[TX] PlutoSDR ready.  Waiting for UDP MPEG-TS ...")
 
     # UDP receiver for GStreamer MPEG-TS output
@@ -889,10 +1217,21 @@ def run_tx(args):
 def run_rx(args):
     print(f"[RX] freq={args.freq/1e6:.1f} MHz  gain={args.gain} dB  uri={args.uri}")
 
+    # ── Calibration ───────────────────────────────────────────────────────────
+    if args.skip_cal:
+        rx_gain = args.gain
+        print(f"[RX] Skipping calibration — RX gain {rx_gain} dB")
+    else:
+        print("[RX] Starting calibration — launch the TX side now.  Beginning in 3 s ...")
+        time.sleep(3)
+        rx_gain, _ = calibrate_dvbt(args.uri, args.freq, 'RX')
+        print(f"[RX] → reuse with --skip-cal --gain {rx_gain}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     stop_evt = threading.Event()
 
     # Open Pluto
-    sdr = setup_pluto_rx(args.uri, args.freq, args.gain)
+    sdr = setup_pluto_rx(args.uri, args.freq, rx_gain)
     print("[RX] PlutoSDR ready.")
 
     # UDP socket to feed GStreamer
@@ -959,6 +1298,8 @@ def main():
                    help='(TX) video only, skip microphone')
     p.add_argument('--save',     metavar='FILE',
                    help='(RX) save received MPEG-TS to file instead of playing')
+    p.add_argument('--skip-cal', action='store_true',
+                   help='skip auto-calibration; use --gain/--attn values directly')
 
     args = p.parse_args()
     (run_tx if args.tx else run_rx)(args)
