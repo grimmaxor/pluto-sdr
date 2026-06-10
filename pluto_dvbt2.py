@@ -773,7 +773,31 @@ def setup_pluto_rx(uri, freq, gain_db):
 # GStreamer bridge
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _find_gst_launch():
+    """Return the gst-launch-1.0 executable path, searching Windows install dirs if needed."""
+    import shutil
+    exe = shutil.which('gst-launch-1.0') or shutil.which('gst-launch-1.0.exe')
+    if exe:
+        return exe
+    if platform.system() == 'Windows':
+        candidates = [
+            r'C:\gstreamer\1.0\msvc_x86_64\bin\gst-launch-1.0.exe',
+            r'C:\gstreamer\1.0\x86_64\bin\gst-launch-1.0.exe',
+            r'C:\gstreamer\1.0\mingw_x86_64\bin\gst-launch-1.0.exe',
+        ]
+        for c in candidates:
+            if os.path.isfile(c):
+                return c
+        raise FileNotFoundError(
+            "gst-launch-1.0.exe not found on PATH or in C:\\gstreamer\\.\n"
+            "Install GStreamer from https://gstreamer.freedesktop.org/download/ "
+            "and add its bin\\ folder to your PATH (or System Environment Variables)."
+        )
+    raise FileNotFoundError("gst-launch-1.0 not found — install GStreamer and add it to PATH.")
+
+
 def _gst_tx_cmd(device, no_audio):
+    gst = _find_gst_launch()
     is_win = platform.system() == 'Windows'
     if is_win:
         vsrc = ['mfvideosrc', f'device-index={device}']
@@ -785,22 +809,23 @@ def _gst_tx_cmd(device, no_audio):
     vcap = vsrc + ['!', 'videoconvert', '!', 'x264enc', 'tune=zerolatency',
                    'bitrate=2000', '!', 'queue', '!', 'mux.']
     if no_audio:
-        return (['gst-launch-1.0', '-v'] + vsrc +
+        return ([gst, '-v'] + vsrc +
                 ['!', 'videoconvert', '!', 'x264enc', 'tune=zerolatency', 'bitrate=2000',
                  '!', 'mpegtsmux', 'alignment=7',
                  '!', 'udpsink', 'host=127.0.0.1', f'port={UDP_IN_PORT}', 'sync=false'])
     acap = asrc + ['!', 'audioconvert', '!', 'avenc_aac', '!', 'queue', '!', 'mux.']
-    return (['gst-launch-1.0', '-v'] + vcap + acap +
+    return ([gst, '-v'] + vcap + acap +
             ['mpegtsmux', 'name=mux', 'alignment=7',
              '!', 'udpsink', 'host=127.0.0.1', f'port={UDP_IN_PORT}', 'sync=false'])
 
 def _gst_rx_cmd(save_path):
+    gst = _find_gst_launch()
     if save_path:
-        return ['gst-launch-1.0', '-v',
+        return [gst, '-v',
                 'udpsrc', f'port={UDP_OUT_PORT}',
                 'caps=video/mpegts,systemstream=(boolean)true',
                 '!', 'filesink', f'location={save_path}']
-    return ['gst-launch-1.0', '-v',
+    return [gst, '-v',
             'udpsrc', f'port={UDP_OUT_PORT}',
             'caps=video/mpegts,systemstream=(boolean)true',
             '!', 'decodebin', 'name=d',
