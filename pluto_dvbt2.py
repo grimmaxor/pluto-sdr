@@ -638,43 +638,65 @@ class DvbtEncoder:
 class DvbtDecoder:
     """Stateful DVB-T RX decoder. Feed IQ sample buffers; poll for TS packets."""
     def __init__(self):
-        self._bit_buf   = []
-        self._deil      = ForneyInterleaver(interleave=False)
-        self._pkt_buf   = bytearray()
-        self._sym_idx   = 0
-        self._cfo_rad   = 0.0          # carrier freq offset estimate (radians/sample)
+        self._bit_buf        = []
+        self._deil           = ForneyInterleaver(interleave=False)
+        self._pkt_buf        = bytearray()
+        self._sym_idx        = 0
+        self._cfo_rad        = 0.0     # carrier freq offset (rad/sample)
+        self._carry          = np.array([], dtype=np.complex64)  # leftover from last buffer
+        self._synced         = False
+        self._syms_since_sync = 0
+
+        # Diagnostics (read from run_rx)
+        self.total_syms      = 0
+        self.total_bits      = 0
+        self.total_ts_pkts   = 0
+        self.peak_signal     = 0.0
 
     def push_samples(self, iq):
         """Push a buffer of complex IQ samples. Returns recovered TS packets."""
-        pkts = []
-        samples = np.asarray(iq, dtype=np.complex64)
+        raw = np.asarray(iq, dtype=np.complex64)
+        self.peak_signal = max(self.peak_signal, float(np.max(np.abs(raw))))
 
-        # CFO correction
+        # Prepend carry-over from previous call so symbol boundaries are continuous
+        samples = np.concatenate([self._carry, raw])
+        self._carry = np.array([], dtype=np.complex64)
+
+        # CFO correction over the combined buffer
         if abs(self._cfo_rad) > 1e-6:
             n = np.arange(len(samples))
             samples = samples * np.exp(-1j * self._cfo_rad * n).astype(np.complex64)
 
-        # Find OFDM symbol boundaries in this buffer
-        n_syms = max(1, len(samples) // SYM_LEN)
-        M, P = schmidl_cox(samples)
-        if len(M) == 0:
-            return pkts
+        # Re-acquire symbol sync if not locked or every 200 symbols to track drift
+        if not self._synced or self._syms_since_sync >= 200:
+            M, P = schmidl_cox(samples)
+            if len(M) == 0:
+                return []
+            peak = int(np.argmax(M))
+            if M[peak] < 0.3:          # no usable signal
+                return []
+            self._synced = True
+            self._syms_since_sync = 0
+            if abs(P[peak]) > 1e-6:
+                self._cfo_rad = -np.angle(P[peak]) / FFT_LEN
+            pos = peak
+        else:
+            pos = 0
 
-        # Simple approach: slide through buffer, grab symbols at detected peaks
-        start = int(np.argmax(M))
-        # Update CFO estimate from CP correlation phase
-        if abs(P[start]) > 1e-6:
-            self._cfo_rad = -np.angle(P[start]) / FFT_LEN
-
-        pos = start
         while pos + SYM_LEN <= len(samples):
             sym = samples[pos + CP_LEN: pos + CP_LEN + FFT_LEN]
             bits = self._decode_one_symbol(sym)
             self._bit_buf.extend(bits)
             pos += SYM_LEN
+            self._syms_since_sync += 1
+            self.total_syms += 1
 
-        # Try to extract TS packets from bit buffer
+        # Carry leftover samples into next call (preserves symbol boundary alignment)
+        self._carry = samples[pos:]
+        self.total_bits = len(self._bit_buf)
+
         pkts = self._drain_packets()
+        self.total_ts_pkts += len(pkts)
         return pkts
 
     def _decode_one_symbol(self, sym_samples_2048):
@@ -1281,6 +1303,10 @@ def run_rx(args):
     signal.signal(signal.SIGINT,  _stop)
     signal.signal(signal.SIGTERM, _stop)
     print("[RX] running — Ctrl+C to stop.")
+    print("[RX] diagnostics printed every 5 s:  peak_signal | synced_syms | buffered_bits | ts_pkts_out\n")
+
+    _diag_t = time.time()
+    _buf_count = 0
 
     while not stop_evt.is_set():
         try:
@@ -1291,12 +1317,23 @@ def run_rx(args):
             continue
 
         pkts = dec.push_samples(iq)
+        _buf_count += 1
+
         for pkt in pkts:
             # Send 188-byte TS packets to GStreamer
             try:
                 sock.sendto(bytes(pkt[:188]), gst_addr)
             except OSError:
                 pass
+
+        # Periodic diagnostics so the operator can see what's happening
+        if time.time() - _diag_t >= 5.0:
+            synced = dec._synced
+            print(f"[diag] peak={dec.peak_signal:7.0f}  syms={dec.total_syms:6d}  "
+                  f"bits_buf={dec.total_bits:7d}  ts_out={dec.total_ts_pkts:5d}  "
+                  f"sync={'YES' if synced else 'NO '}  bufs={_buf_count}")
+            dec.peak_signal = 0.0   # reset per-window peak
+            _diag_t = time.time()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Entry point
