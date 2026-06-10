@@ -520,13 +520,14 @@ def extract_data_syms(fft_out_2048, sym_idx):
     known_pilots = np.array([_pilot_value(k) for k in pilot_pos], dtype=np.complex64)
     H_at_pilots  = active[pilot_pos] / (known_pilots + 1e-12)
 
-    # Interpolate channel over all active carriers
-    H_interp = np.interp(
-        np.arange(N_ACTIVE),
-        pilot_pos.astype(float),
-        H_at_pilots,
-        left=H_at_pilots[0], right=H_at_pilots[-1]
-    )
+    # Interpolate channel over all active carriers (interp requires real; split I/Q)
+    x  = np.arange(N_ACTIVE)
+    xp = pilot_pos.astype(float)
+    H_interp = (np.interp(x, xp, H_at_pilots.real,
+                          left=H_at_pilots[0].real, right=H_at_pilots[-1].real)
+                + 1j * np.interp(x, xp, H_at_pilots.imag,
+                                 left=H_at_pilots[0].imag, right=H_at_pilots[-1].imag)
+                ).astype(np.complex64)
 
     # Equalize data carriers
     data_eq = active[data_pos] / (H_interp[data_pos] + 1e-12)
