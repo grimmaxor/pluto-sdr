@@ -387,14 +387,14 @@ def bit_inner_interleave(bits_3024):
     return result.tolist()
 
 def bit_inner_deinterleave(bits_3024):
-    """Inverse bit inner interleaver."""
+    """Inverse bit inner interleaver.
+    TX scatter: out[H[q]] = plane[q]  →  RX gather: plane_rec[q] = out[H[q]]
+    """
     b = np.array(bits_3024, dtype=np.int8)
     plane0 = b[0::2]
     plane1 = b[1::2]
-    inv_H = np.empty(N_DATA, dtype=np.int32)
-    inv_H[_BIT_IL] = np.arange(N_DATA, dtype=np.int32)
-    out0 = plane0[inv_H]
-    out1 = plane1[inv_H]
+    out0 = plane0[_BIT_IL]   # gather: out0[q] = plane0[H[q]]
+    out1 = plane1[_BIT_IL]
     result = np.empty(2 * N_DATA, dtype=np.int8)
     result[0::2] = out0
     result[1::2] = out1
@@ -416,12 +416,12 @@ def symbol_inner_interleave(cells_1512, sym_idx):
     return out.tolist()
 
 def symbol_inner_deinterleave(cells_1512, sym_idx):
-    """Inverse symbol inner interleaver."""
+    """Inverse symbol inner interleaver.
+    TX scatter: out[R[q]] = c[q]  →  RX gather: c_rec[q] = out[R[q]]
+    """
     R = _SYM_IL_E if (sym_idx % 2 == 0) else _SYM_IL_O
-    inv_R = np.empty(N_DATA, dtype=np.int32)
-    inv_R[R] = np.arange(N_DATA, dtype=np.int32)
     c = np.array(cells_1512, dtype=np.int8)
-    return c[inv_R].tolist()
+    return c[R].tolist()   # gather: c_rec[q] = received_out[R[q]]
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Layer 8: QPSK mapper / demapper
