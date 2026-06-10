@@ -1,16 +1,21 @@
 #!/usr/bin/env python3
 """
-dvbt_video.py — DVB-T video streaming over PlutoSDR / FMCOMMS2
+dvbt_video.py — DVB-T live camera streaming over PlutoSDR / FMCOMMS2
 
-TX: reads a video file, pipes it as MPEG-TS over UDP into a DVB-T GNU Radio
-    transmitter, and sends it out over the air.
+TX (Windows): captures the internal camera + microphone via GStreamer,
+    encodes to H.264/AAC MPEG-TS, and pipes it into a DVB-T GNU Radio
+    transmitter which sends it over the air.
 
-RX: runs a DVB-T GNU Radio receiver, pipes decoded MPEG-TS out over UDP, and
-    hands it to GStreamer for playback or saving.
+RX (Linux):   runs a DVB-T GNU Radio receiver, decodes the signal, and
+    pipes the recovered MPEG-TS to GStreamer for playback or saving.
 
 Usage:
-  python3 dvbt_video.py --tx [--file FILE] [--freq 2.4e9] [--uri ip:192.168.2.1] [--attn 8]
-  python3 dvbt_video.py --rx [--freq 2.4e9] [--uri ip:192.168.2.1] [--gain 30] [--save out.ts]
+  python dvbt_video.py --tx [--device 0] [--no-audio] [--freq 2.4e9] [--uri ip:192.168.2.1] [--attn 8] 
+  python dvbt_video.py --rx [--freq 2.4e9] [--uri ip:192.168.2.1] [--gain 30] [--save out.ts]
+
+TX GStreamer elements used (Windows):
+  mfvideosrc  — Media Foundation camera capture (built into Windows 10/11)
+  wasapisrc   — Windows Audio Session API microphone capture
 """
 
 import os
@@ -26,6 +31,7 @@ if os.path.exists(_LIBIIO_COMPAT):
 # ───────────────────────────────────────────────────────────────────────────
 
 import argparse
+import platform
 import signal
 import subprocess
 import threading
@@ -44,62 +50,63 @@ GR_UDP_IN_PORT  = 2000   # GStreamer → GR TX
 GR_UDP_OUT_PORT = 2001   # GR RX → GStreamer
 
 
-# ── File picker ──────────────────────────────────────────────────────────────
-
-def pick_file():
-    """Open a GUI file dialog, or fall back to stdin."""
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes('-topmost', True)
-        path = filedialog.askopenfilename(
-            title="Select video file to transmit",
-            filetypes=[
-                ("Video / TS files", "*.ts *.mp4 *.mkv *.avi *.mov *.m2ts"),
-                ("All files", "*.*"),
-            ],
-        )
-        root.destroy()
-        return path.strip()
-    except Exception:
-        return input("Path to video file: ").strip()
-
-
 # ── GStreamer pipeline builders ──────────────────────────────────────────────
 
-def _gst_tx_cmd(filepath):
-    """Return gst-launch command list to stream FILE → UDP port 2000."""
-    ext = os.path.splitext(filepath)[1].lower()
-    if ext in ('.ts', '.m2ts', '.mpg', '.mpeg'):
-        # Already MPEG-TS: parse and send directly.
-        # alignment=7 → 7×188 = 1316 B per UDP packet, matching GR payloadsize.
-        return [
-            'gst-launch-1.0', '-v',
-            'filesrc', f'location={filepath}',
-            '!', 'tsparse', 'alignment=7',
-            '!', 'udpsink', 'host=127.0.0.1', f'port={GR_UDP_IN_PORT}', 'sync=false',
-        ]
+def _gst_tx_cmd(device, no_audio=False):
+    """
+    Return gst-launch command list to capture camera → MPEG-TS → UDP port 2000.
+
+    Windows elements:
+      mfvideosrc device-index=N  — Media Foundation camera (N = 0, 1, 2 …)
+      wasapisrc                  — Windows Audio Session API microphone
+
+    Linux elements (fallback):
+      v4l2src device=/dev/videoN
+      pulsesrc
+    """
+    is_win = platform.system() == 'Windows'
+
+    if is_win:
+        # device is an integer index string, e.g. '0'
+        video_src  = ['mfvideosrc',  f'device-index={device}']
+        audio_src  = ['wasapisrc']
     else:
-        # Re-encode to H.264/AAC MPEG-TS at 2 Mbit/s (fits in DVB-T T2k/QPSK capacity).
-        return [
-            'gst-launch-1.0', '-v',
-            'filesrc', f'location={filepath}',
-            '!', 'decodebin', 'name=d',
-            'd.',
-            '!', 'queue',
-            '!', 'videoconvert',
-            '!', 'x264enc', 'tune=zerolatency', 'bitrate=2000',
-            '!', 'queue', '!', 'mux.',
-            'd.',
-            '!', 'queue',
-            '!', 'audioconvert',
-            '!', 'avenc_aac',
-            '!', 'queue', '!', 'mux.',
-            'mpegtsmux', 'name=mux', 'alignment=7',
-            '!', 'udpsink', 'host=127.0.0.1', f'port={GR_UDP_IN_PORT}', 'sync=false',
-        ]
+        # device is a path string, e.g. '/dev/video0'
+        video_src  = ['v4l2src', f'device={device}']
+        audio_src  = ['pulsesrc']
+
+    video_chain = (
+        video_src
+        + ['!', 'videoconvert',
+           '!', 'x264enc', 'tune=zerolatency', 'bitrate=2000',
+           '!', 'queue', '!', 'mux.']
+    )
+
+    if no_audio:
+        # Video-only path: simpler single-branch pipeline
+        return (
+            ['gst-launch-1.0', '-v']
+            + video_src
+            + ['!', 'videoconvert',
+               '!', 'x264enc', 'tune=zerolatency', 'bitrate=2000',
+               '!', 'mpegtsmux', 'alignment=7',
+               '!', 'udpsink', 'host=127.0.0.1', f'port={GR_UDP_IN_PORT}', 'sync=false']
+        )
+
+    audio_chain = (
+        audio_src
+        + ['!', 'audioconvert',
+           '!', 'avenc_aac',
+           '!', 'queue', '!', 'mux.']
+    )
+
+    return (
+        ['gst-launch-1.0', '-v']
+        + video_chain
+        + audio_chain
+        + ['mpegtsmux', 'name=mux', 'alignment=7',
+           '!', 'udpsink', 'host=127.0.0.1', f'port={GR_UDP_IN_PORT}', 'sync=false']
+    )
 
 
 def _gst_rx_cmd(save_path=None):
@@ -270,15 +277,15 @@ def _run_gst_loop(cmd, stop_evt):
 
 
 def run_tx(args):
-    filepath = args.file or pick_file()
-    if not filepath or not os.path.exists(filepath):
-        sys.exit(f"[TX] File not found: {filepath!r}")
+    is_win = platform.system() == 'Windows'
+    device = args.device if args.device else ('0' if is_win else '/dev/video0')
 
-    print(f"[TX] File : {filepath}")
-    print(f"[TX] Freq : {args.freq/1e6:.1f} MHz   Attn: {args.attn} dB   URI: {args.uri}")
+    print(f"[TX] Camera : {'mfvideosrc device-index=' if is_win else 'v4l2src device='}{device}")
+    print(f"[TX] Audio  : {'wasapisrc (Windows)' if (not args.no_audio) else 'disabled'}")
+    print(f"[TX] Freq   : {args.freq/1e6:.1f} MHz   Attn: {args.attn} dB   URI: {args.uri}")
 
     stop_evt = threading.Event()
-    gst_cmd  = _gst_tx_cmd(filepath)
+    gst_cmd  = _gst_tx_cmd(device, no_audio=args.no_audio)
     gst_thread = threading.Thread(target=_run_gst_loop, args=(gst_cmd, stop_evt), daemon=True)
     gst_thread.start()
 
@@ -348,8 +355,11 @@ def main():
     mode.add_argument('--tx', action='store_true', help="Transmit mode")
     mode.add_argument('--rx', action='store_true', help="Receive mode")
 
-    p.add_argument('--file', metavar='FILE',
-                   help="(TX) video file to stream; if omitted a file-picker opens")
+    p.add_argument('--device', metavar='DEV',
+                   help="(TX) camera device — Windows: index integer (default 0); "
+                        "Linux: path (default /dev/video0)")
+    p.add_argument('--no-audio', action='store_true',
+                   help="(TX) stream video only, skip microphone capture")
     p.add_argument('--freq', type=float, default=2.4e9,
                    help="RF centre frequency in Hz (default: 2.4e9)")
     p.add_argument('--uri',  default='ip:192.168.2.1',
