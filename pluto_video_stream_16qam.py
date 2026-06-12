@@ -253,8 +253,11 @@ def sender_main(sdr):
     ]
     
     if args.input.startswith('/dev/video'):
-        # Live webcam
+        # Live webcam (Linux)
         ffmpeg_cmd += ['-f', 'v4l2', '-i', args.input]
+    elif args.input.startswith('video='):
+        # Live webcam (Windows)
+        ffmpeg_cmd += ['-f', 'dshow', '-i', args.input]
     else:
         # File stream (read in realtime so we don't overflow the RF link)
         ffmpeg_cmd += ['-re', '-i', args.input]
