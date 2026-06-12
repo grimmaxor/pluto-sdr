@@ -154,6 +154,19 @@ def packet_to_iq(pkt_bytes):
 
 
 # ─── RX DEMODULATION ──────────────────────────────────────────────────────────
+def _cfo_variants(iq):
+    yield iq
+    # Estimate CFO using 4th-power FFT on a slice of data to save CPU
+    sl = iq[:65536]
+    nrm = sl / (np.max(np.abs(sl)) + 1e-9)
+    sq = nrm ** 4
+    n = len(sq)
+    fv = np.fft.fft(sq); fv[0] = 0
+    freqs = np.fft.fftfreq(n, d=1.0/SAMPLE_RATE)
+    cfo = freqs[int(np.argmax(np.abs(fv)))] / 4
+    if abs(cfo) > 50:
+        t = np.arange(len(iq)) / SAMPLE_RATE
+        yield (iq * np.exp(-1j * 2*np.pi*cfo*t)).astype(np.complex64)
 def iq_to_packets(iq):
     peak = np.max(np.abs(iq))
     if peak < 5:
@@ -162,14 +175,15 @@ def iq_to_packets(iq):
     found = {}
     delay = len(FILT) // 2
 
-    fi = lfilter(FILT, 1.0, iq.real).astype(np.float32)
-    fq = lfilter(FILT, 1.0, iq.imag).astype(np.float32)
-    filt = (fi + 1j * fq).astype(np.complex64)
-    
-    n = len(filt)
-    for toff in range(SAMPLES_PER_SYMBOL):
-        start = (delay + toff) % SAMPLES_PER_SYMBOL
-        stream = filt[start::SAMPLES_PER_SYMBOL]
+    for corrected_iq in _cfo_variants(iq):
+        fi = lfilter(FILT, 1.0, corrected_iq.real).astype(np.float32)
+        fq = lfilter(FILT, 1.0, corrected_iq.imag).astype(np.float32)
+        filt = (fi + 1j * fq).astype(np.complex64)
+        
+        n = len(filt)
+        for toff in range(SAMPLES_PER_SYMBOL):
+            start = (delay + toff) % SAMPLES_PER_SYMBOL
+            stream = filt[start::SAMPLES_PER_SYMBOL]
         if len(stream) < PREAMBLE_LEN + 32:
             continue
             
@@ -206,6 +220,10 @@ def iq_to_packets(iq):
                 if pkt:
                     found[pkt['seq']] = pkt
                     break
+        
+        # If we found packets with this CFO, stop searching variants
+        if found:
+            break
     
     # Return sorted by sequence number
     return [found[k] for k in sorted(found.keys())]
