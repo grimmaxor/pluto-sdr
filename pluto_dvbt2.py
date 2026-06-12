@@ -113,6 +113,16 @@ PLUTO_BUF = 32768
 # Batching: process this many OFDM symbols at once for TX DMA efficiency
 TX_BATCH_SYMS = 64
 
+# Integer carrier-frequency-offset search range (subcarriers). Two free-running
+# Plutos at 2.4 GHz can differ by >100 subcarriers (1562.5 Hz each) and the offset
+# drifts between power-ons; ±150 covers ~±234 kHz ≈ ±98 ppm. Hard ceiling is ±171
+# (active band K_MIN_BIN=172 + N_ACTIVE=1705 must fit the 2048-pt FFT). Only the
+# fractional part is removed in the time domain.
+_CFO_SEARCH = 150
+_ACQ_SYMS    = 10   # OFDM symbols averaged for robust initial CFO/phase acquisition
+_TRACK_SYMS  = 6    # symbols averaged for periodic narrow CFO tracking
+_TRACK_RANGE = 3    # ± subcarriers searched around the held CFO while tracking
+
 # ══════════════════════════════════════════════════════════════════════════════
 # DVB-T table generation  (computed once at module load)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -257,11 +267,15 @@ class ForneyInterleaver:
         delays = [j * M for j in range(I)] if interleave else [(I - 1 - j) * M for j in range(I)]
         from collections import deque
         self.fifos = [deque([0] * d) for d in delays]
+        self._idx  = 0      # PERSISTENT byte index across feed() calls — branch
+                            # continuity must not depend on feed-chunk size (the RX
+                            # feeds variable-length chunks; a per-call reset desyncs it)
 
     def feed(self, data):
         out = bytearray()
-        for idx, b in enumerate(data):
-            branch = idx % self.I
+        for b in data:
+            branch = self._idx % self.I
+            self._idx += 1
             f = self.fifos[branch]
             f.append(b)
             out.append(f.popleft())
@@ -292,7 +306,10 @@ def puncture_7_8(a_bits, b_bits):
     return out
 
 def depuncture_7_8(bits):
-    """Undo rate-7/8 puncturing: insert 0 (erasure) for punctured positions."""
+    """Undo rate-7/8 puncturing. Punctured positions are ERASURES, marked with the
+    sentinel -1 so the Viterbi adds no branch-metric there (inserting a real 0 would
+    make the hard-decision decoder treat unknown bits as received zeros — which
+    corrupts ~half the metrics and destroys decoding)."""
     # 8 input bits → 14 depunctured bits (7 pairs)
     n = (len(bits) // 8) * _PUNCT_PERIOD
     a_dep, b_dep = [], []
@@ -300,13 +317,13 @@ def depuncture_7_8(bits):
     for i in range(n):
         p = i % _PUNCT_PERIOD
         if _PUNCT_A[p]:
-            a_dep.append(bits[idx] if idx < len(bits) else 0); idx += 1
+            a_dep.append(bits[idx] if idx < len(bits) else -1); idx += 1
         else:
-            a_dep.append(0)
+            a_dep.append(-1)   # erasure
         if _PUNCT_B[p]:
-            b_dep.append(bits[idx] if idx < len(bits) else 0); idx += 1
+            b_dep.append(bits[idx] if idx < len(bits) else -1); idx += 1
         else:
-            b_dep.append(0)
+            b_dep.append(-1)   # erasure
     # Interleave: a[0], b[0], a[1], b[1], ...
     interleaved = []
     for x, y in zip(a_dep, b_dep):
@@ -347,7 +364,8 @@ def viterbi_hard(recv_bits):
                 continue
             for bit in range(2):
                 ns, ea, eb = _TRANS[(s, bit)]
-                bm = (ra != ea) + (rb != eb)
+                # Erasures (recv == -1) contribute no metric — they are punctured bits.
+                bm = (0 if ra < 0 else (ra != ea)) + (0 if rb < 0 else (rb != eb))
                 cand = pm[s] + bm
                 if cand < new_pm[ns]:
                     new_pm[ns] = cand
@@ -503,14 +521,16 @@ def build_ofdm_symbol(data_syms_1512, sym_idx):
     # Cyclic prefix
     return np.concatenate([time_sym[-CP_LEN:], time_sym])  # 2112 samples
 
-def extract_data_syms(fft_out_2048, sym_idx):
+def extract_data_syms(fft_out_2048, sym_idx, shift=0):
     """From FFT output (2048 bins), extract 1512 equalized data subcarriers.
     fft_out_2048 already channel-equalized.
+    `shift` = integer carrier-frequency offset in subcarriers (from acquisition).
     Returns (data_syms_1512, pilot_estimates_dict).
     """
     # fft_out_2048 is in FFT-native order; shift to baseband order
     freq = np.fft.fftshift(fft_out_2048)
-    active = freq[K_MIN_BIN: K_MIN_BIN + N_ACTIVE]
+    base = K_MIN_BIN + shift
+    active = freq[base: base + N_ACTIVE]
 
     pilot_mask = _all_pilot_mask(sym_idx)
     data_pos   = np.where(~pilot_mask)[0]
@@ -646,6 +666,30 @@ class DvbtDecoder:
         self._carry          = np.array([], dtype=np.complex64)  # leftover from last buffer
         self._synced         = False
         self._syms_since_sync = 0
+        self._pilot_phase    = 0       # detected scattered-pilot phase (sym_idx mod 4)
+        self._last_phase_score = 0.0   # pilot coherence of last detection (≈1 = locked)
+        self._carrier_shift  = 0       # integer CFO (subcarriers) from acquisition
+        # Pre-compute the FULL known-pilot set (scattered + continual + TPS) for each
+        # of the 4 scattered-pilot phases. Scattered pilots alone repeat every 12
+        # subcarriers, so a CFO search using only them aliases every 12 bins; the
+        # irregularly-spaced continual/TPS carriers cohere at exactly one integer
+        # offset and break that ambiguity.
+        self._full_pilot_pos   = []
+        self._full_pilot_known = []
+        for _p in range(4):
+            _pos = np.where(_all_pilot_mask(_p))[0].astype(np.int32)
+            self._full_pilot_pos.append(_pos)
+            self._full_pilot_known.append(
+                np.array([_pilot_value(int(k)) for k in _pos],
+                         dtype=np.complex64) + 1e-12)
+
+        # Frame (byte/RS) synchronization state
+        self._framed       = False     # locked onto the 204-byte sync-byte period?
+        self._rs_buf       = bytearray()  # deinterleaved RS-coded bytes (block-aligned)
+        self._group        = []        # decoded 188-byte packets, anchored on 0xB8
+        self._deil_warmup  = 0         # deinterleaver transient bytes left to discard
+        self._rs_fail      = 0         # consecutive RS-decode failures (lock-loss guard)
+        self._lowscore     = 0         # consecutive low-pscore re-acquisitions
 
         # Diagnostics (read from run_rx)
         self.total_syms      = 0
@@ -667,8 +711,12 @@ class DvbtDecoder:
             n = np.arange(len(samples))
             samples = samples * np.exp(-1j * self._cfo_rad * n).astype(np.complex64)
 
-        # Re-acquire symbol sync if not locked or every 200 symbols to track drift
-        if not self._synced or self._syms_since_sync >= 200:
+        # Timing sync is STICKY: Schmidl-Cox runs only on initial acquisition so the
+        # decoded bitstream stays byte-continuous (frame lock below depends on it).
+        # The integer CFO between the two free-running Plutos still drifts, so it is
+        # re-acquired every 40 symbols WITHOUT moving the symbol boundary or resetting
+        # the symbol counter — a carrier-only update.
+        if not self._synced:
             M, P = schmidl_cox(samples)
             if len(M) == 0:
                 return []
@@ -677,11 +725,49 @@ class DvbtDecoder:
                 return []
             self._synced = True
             self._syms_since_sync = 0
-            if abs(P[peak]) > 1e-6:
-                self._cfo_rad = -np.angle(P[peak]) / FFT_LEN
             pos = peak
+            # Robust initial acquisition: coarse integer-CFO + phase over the full
+            # ±_CFO_SEARCH range averaged over many symbols (kills mod-12 aliases),
+            # THEN a fine fractional-CFO refinement by coherence. The fractional part
+            # is searched, not derived from the CP-correlation sign (which depends on
+            # the unknown sign of the physical LO offset) — a residual fractional CFO
+            # is ICI that caps pscore and destabilizes the integer search.
+            syms = self._collect_syms(samples, pos, _ACQ_SYMS)
+            if syms:
+                shift, ph, score = self._acquire_carrier(syms)
+                delta, score = self._refine_cfo(syms, shift, ph)
+                self._carrier_shift = shift
+                self._cfo_rad += 2 * np.pi * delta / FFT_LEN   # accumulate residual
+                self._pilot_phase = ph
+                self._last_phase_score = score
+                self._sym_idx = ph
         else:
             pos = 0
+            # Periodic NARROW carrier tracking around the held CFO — no timing jump,
+            # no _sym_idx reset. The phase is known (running counter), so only the
+            # integer shift is searched in a small ±_TRACK_RANGE window: this holds the
+            # lock instead of hopping to a far-off alias.
+            if self._syms_since_sync >= 40:
+                self._syms_since_sync = 0
+                syms = self._collect_syms(samples, pos, _TRACK_SYMS)
+                if syms:
+                    lo = max(-_CFO_SEARCH, self._carrier_shift - _TRACK_RANGE)
+                    hi = min(_CFO_SEARCH, self._carrier_shift + _TRACK_RANGE)
+                    shift, _, score = self._acquire_carrier(
+                        syms, lo, hi, phase0=self._sym_idx & 3)
+                    delta, score = self._refine_cfo(syms, shift, self._sym_idx & 3)
+                    self._carrier_shift = shift
+                    self._cfo_rad += 2 * np.pi * delta / FFT_LEN  # track frac drift
+                    self._last_phase_score = score
+                    self._pilot_phase = self._sym_idx & 3
+                    if score < 0.5:
+                        self._lowscore += 1
+                        if self._lowscore >= 4:   # genuine loss → re-time & re-frame
+                            self._synced = False
+                            self._framed = False
+                            self._lowscore = 0
+                    else:
+                        self._lowscore = 0
 
         while pos + SYM_LEN <= len(samples):
             sym = samples[pos + CP_LEN: pos + CP_LEN + FFT_LEN]
@@ -699,11 +785,87 @@ class DvbtDecoder:
         self.total_ts_pkts += len(pkts)
         return pkts
 
+    def _acquire_carrier(self, sym_list, shift_lo=-_CFO_SEARCH, shift_hi=_CFO_SEARCH,
+                         phase0=None):
+        """Joint integer-CFO (carrier-bin) + scattered-pilot-phase acquisition,
+        averaged over several consecutive OFDM symbols.
+
+        For each candidate (integer carrier shift δ, starting mod-4 phase p0) the FULL
+        pilot set (scattered + continual + TPS) is divided by its known BPSK values to
+        form a per-pilot channel estimate H[k]; the differential-coherence metric
+        |Σ H[k+1]·conj(H[k])| / Σ|H[k+1]||H[k]| is ≈1 when that (δ, phase) is right and
+        ~0 otherwise. It is averaged over the supplied consecutive symbols, advancing
+        the scattered-pilot phase by +1 each symbol. A wrong δ that happens to alias
+        the 12-spaced scattered grid only coheres on isolated symbols, so averaging
+        over many symbols makes the true offset win decisively. `phase0` (when given)
+        fixes the starting phase — used for cheap narrow tracking once locked.
+        Returns (best_shift, best_phase0, best_score).
+        """
+        ffts = [np.fft.fftshift(np.fft.fft(s).astype(np.complex64)) for s in sym_list]
+        nT   = max(1, len(ffts))
+        p0_range = range(4) if phase0 is None else [int(phase0) & 3]
+        best_shift, best_p, best_score = 0, (phase0 or 0), -1.0
+        for shift in range(shift_lo, shift_hi + 1):
+            base = K_MIN_BIN + shift
+            if base < 0 or base + N_ACTIVE > FFT_LEN:
+                continue
+            actives = [f[base: base + N_ACTIVE] for f in ffts]
+            for p0 in p0_range:
+                total = 0.0
+                for t, active in enumerate(actives):
+                    p     = (p0 + t) & 3
+                    pos   = self._full_pilot_pos[p]
+                    H     = active[pos] / self._full_pilot_known[p]
+                    d     = H[1:] * np.conj(H[:-1])
+                    denom = float(np.sum(np.abs(H[:-1]) * np.abs(H[1:]))) + 1e-12
+                    total += float(np.abs(np.sum(d)) / denom)
+                total /= nT
+                if total > best_score:
+                    best_score, best_shift, best_p = total, shift, p0
+        return best_shift, best_p, best_score
+
+    def _collect_syms(self, samples, pos, n):
+        """Slice up to n consecutive 2048-sample OFDM bodies starting at CP+pos."""
+        syms = []
+        q = pos
+        while q + SYM_LEN <= len(samples) and len(syms) < n:
+            syms.append(samples[q + CP_LEN: q + CP_LEN + FFT_LEN])
+            q += SYM_LEN
+        return syms
+
+    def _refine_cfo(self, sym_list, shift, phase0, span=0.6, steps=25):
+        """Fine fractional-CFO search. Derotate each symbol by exp(-j·2π·δ·n/N) over a
+        grid of δ (subcarriers) and maximize full-pilot differential coherence at the
+        given integer shift / starting phase. Sign-agnostic — it finds the true
+        residual directly rather than assuming the CP-estimator sign, so a residual
+        fractional CFO (constant ICI that caps pscore and destabilizes the integer
+        search on hardware) is removed. Returns (best_delta_subcarriers, best_score)."""
+        n = np.arange(FFT_LEN)
+        base = K_MIN_BIN + shift
+        if base < 0 or base + N_ACTIVE > FFT_LEN:
+            return 0.0, -1.0
+        best_d, best_s = 0.0, -1.0
+        for delta in np.linspace(-span, span, steps):
+            rot = np.exp(-1j * 2 * np.pi * delta * n / FFT_LEN).astype(np.complex64)
+            total = 0.0
+            for t, sym in enumerate(sym_list):
+                f      = np.fft.fftshift(np.fft.fft(sym * rot).astype(np.complex64))
+                active = f[base: base + N_ACTIVE]
+                p      = (phase0 + t) & 3
+                H      = active[self._full_pilot_pos[p]] / self._full_pilot_known[p]
+                d      = H[1:] * np.conj(H[:-1])
+                denom  = float(np.sum(np.abs(H[:-1]) * np.abs(H[1:]))) + 1e-12
+                total += float(np.abs(np.sum(d)) / denom)
+            total /= max(1, len(sym_list))
+            if total > best_s:
+                best_s, best_d = total, float(delta)
+        return best_d, best_s
+
     def _decode_one_symbol(self, sym_samples_2048):
         # FFT
         fft_out = np.fft.fft(sym_samples_2048).astype(np.complex64)
-        # Channel equalization + data extraction
-        data_eq, _ = extract_data_syms(fft_out, self._sym_idx)
+        # Channel equalization + data extraction (with acquired integer CFO)
+        data_eq, _ = extract_data_syms(fft_out, self._sym_idx, self._carrier_shift)
         self._sym_idx += 1
         # QPSK demap
         cells = qpsk_demap(data_eq)
@@ -721,33 +883,103 @@ class DvbtDecoder:
         decoded = viterbi_hard(dep)
         return decoded
 
+    _FRAME_SEARCH_PKTS  = 16   # RS packets to verify sync-byte periodicity over
+    _DEIL_WARMUP_BLOCKS = 12   # 204-byte blocks of deinterleaver transient to drop
+
+    def _try_frame_lock(self):
+        """Lock byte / Forney-branch / RS-block alignment via the TS sync byte.
+
+        After Viterbi the bitstream is the Forney-INTERLEAVED RS-coded byte stream.
+        Forney branch 0 has zero delay, so the sync byte at the head of every 204-byte
+        RS packet passes through untouched — in the interleaved stream every 204th byte
+        is 0x47 (or 0xB8 for the first packet of each group of 8). Finding the bit
+        offset + 204-byte phase where that byte is consistently a sync byte fixes byte
+        alignment, Forney branch-0 alignment and RS-block alignment in one shot.
+        Returns True once locked (and consumes bits up to the first aligned sync byte).
+        """
+        need_bits = (self._FRAME_SEARCH_PKTS + 2) * 204 * 8
+        if len(self._bit_buf) < need_bits:
+            return False
+        bits    = np.array(self._bit_buf, dtype=np.uint8)
+        weights = (1 << np.arange(7, -1, -1)).astype(np.uint16)
+        for boff in range(8):
+            usable = (len(bits) - boff) // 8
+            if usable < 204 * (self._FRAME_SEARCH_PKTS + 1):
+                continue
+            byte_arr = (bits[boff: boff + usable * 8].reshape(usable, 8) * weights
+                        ).sum(axis=1).astype(np.uint8)
+            n204 = usable // 204
+            grid = byte_arr[:n204 * 204].reshape(n204, 204)
+            frac = ((grid == 0x47) | (grid == 0xB8)).mean(axis=0)
+            phase = int(np.argmax(frac))
+            if frac[phase] >= 0.5:     # random phases sit at ~1/256; 0.5 is unambiguous
+                consumed = boff + phase * 8
+                self._bit_buf      = self._bit_buf[consumed:]
+                self._framed       = True
+                self._deil         = ForneyInterleaver(interleave=False)  # branch-0
+                self._deil_warmup  = self._DEIL_WARMUP_BLOCKS * 204
+                self._rs_buf       = bytearray()
+                self._group        = []
+                self._rs_fail      = 0
+                print(f"[RX] FRAME LOCK  bit_offset={boff}  block_phase={phase}  "
+                      f"sync={frac[phase]*100:.0f}%")
+                return True
+        if len(self._bit_buf) > need_bits * 3:     # cap growth while still searching
+            self._bit_buf = self._bit_buf[-need_bits:]
+        return False
+
     def _drain_packets(self):
-        BITS_PER_CODED_PKT = 204 * 8  # post-RS bytes × 8
         pkts = []
-        # Convert bits to RS-coded bytes
-        while len(self._bit_buf) >= BITS_PER_CODED_PKT:
-            raw = self._bit_buf[:BITS_PER_CODED_PKT]
-            self._bit_buf = self._bit_buf[BITS_PER_CODED_PKT:]
-            b = 0
-            coded_bytes = bytearray()
-            for i, bit in enumerate(raw):
-                b = (b << 1) | bit
-                if (i + 1) % 8 == 0:
-                    coded_bytes.append(b & 0xFF)
-                    b = 0
-            # Forney deinterleave
-            deiled = self._deil.feed(bytes(coded_bytes))
-            # Accumulate 8 RS-coded packets before energy descramble
-            self._pkt_buf.extend(deiled)
-            while len(self._pkt_buf) >= 8 * 204:
-                group = [self._pkt_buf[i*204:(i+1)*204] for i in range(8)]
-                self._pkt_buf = self._pkt_buf[8*204:]
+        if not self._framed:
+            if not self._try_frame_lock():
+                return pkts
+
+        # bit_buf starts byte-aligned on a sync byte → pack whole bytes directly.
+        nbytes = len(self._bit_buf) // 8
+        if nbytes:
+            weights  = (1 << np.arange(7, -1, -1)).astype(np.uint16)
+            b        = np.array(self._bit_buf[:nbytes * 8], dtype=np.uint8).reshape(nbytes, 8)
+            byte_arr = (b * weights).sum(axis=1).astype(np.uint8)
+            self._bit_buf = self._bit_buf[nbytes * 8:]
+            # Forney deinterleave (continuous, branch-0 aligned), drop the transient.
+            deiled = self._deil.feed(bytes(byte_arr.tolist()))
+            if self._deil_warmup > 0:
+                drop = min(self._deil_warmup, len(deiled))
+                self._deil_warmup -= drop
+                deiled = deiled[drop:]
+            self._rs_buf.extend(deiled)
+
+        # Consume whole 204-byte RS blocks; anchor groups of 8 on the 0xB8 sync byte.
+        while len(self._rs_buf) >= 204:
+            block = bytes(self._rs_buf[:204])
+            del self._rs_buf[:204]
+            try:
+                pkt188 = rs_decode_pkt(block)
+                ok = True
+            except Exception:
+                pkt188, ok = None, False
+
+            if ok and pkt188[0] == 0xB8:
+                self._group  = [pkt188]                       # (re)anchor group of 8
+                self._rs_fail = 0
+            elif self._group:                                 # group open → keep filling
+                self._group.append(pkt188 if ok else bytes(188))
+                self._rs_fail = 0 if ok else self._rs_fail + 1
+            else:
+                self._rs_fail = 0 if ok else self._rs_fail + 1
+
+            if len(self._group) == 8:
                 try:
-                    decoded = [rs_decode_pkt(bytes(p)) for p in group]
-                    descrambled = energy_descramble(decoded)
-                    pkts.extend(descrambled)
+                    pkts.extend(energy_descramble(self._group))
                 except Exception:
-                    pass  # uncorrectable RS errors: drop group
+                    pass
+                self._group = []
+
+            if self._rs_fail >= 24:        # alignment lost → re-search frame lock
+                self._framed = False
+                self._group  = []
+                self._rs_fail = 0
+                break
         return pkts
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1329,9 +1561,12 @@ def run_rx(args):
         # Periodic diagnostics so the operator can see what's happening
         if time.time() - _diag_t >= 5.0:
             synced = dec._synced
+            sat = '  ⚠ ADC SATURATED — lower --gain' if dec.peak_signal >= 2800 else ''
             print(f"[diag] peak={dec.peak_signal:7.0f}  syms={dec.total_syms:6d}  "
-                  f"bits_buf={dec.total_bits:7d}  ts_out={dec.total_ts_pkts:5d}  "
-                  f"sync={'YES' if synced else 'NO '}  bufs={_buf_count}")
+                  f"ts_out={dec.total_ts_pkts:5d}  sync={'YES' if synced else 'NO '}  "
+                  f"frame={'YES' if dec._framed else 'NO '}  cfo={dec._carrier_shift:+d}  "
+                  f"ph={dec._pilot_phase}  pscore={dec._last_phase_score:.2f}  "
+                  f"bufs={_buf_count}{sat}")
             dec.peak_signal = 0.0   # reset per-window peak
             _diag_t = time.time()
 
