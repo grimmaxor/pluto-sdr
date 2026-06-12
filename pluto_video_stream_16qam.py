@@ -167,9 +167,14 @@ def _cfo_variants(iq):
     fv = np.fft.fft(sq); fv[0] = 0
     freqs = np.fft.fftfreq(n, d=1.0/SAMPLE_RATE)
     cfo = freqs[int(np.argmax(np.abs(fv)))] / 4
-    if abs(cfo) > 50:
-        t = np.arange(len(iq)) / SAMPLE_RATE
-        yield (iq * np.exp(-1j * 2*np.pi*cfo*t)).astype(np.complex64)
+    
+    t = np.arange(len(iq)) / SAMPLE_RATE
+    yield (iq * np.exp(-1j * 2*np.pi*cfo*t)).astype(np.complex64)
+    
+    # 16QAM is incredibly phase-sensitive. We yield tiny micro-offsets 
+    # to catch packets that drifted during transmission.
+    yield (iq * np.exp(-1j * 2*np.pi*(cfo + 15)*t)).astype(np.complex64)
+    yield (iq * np.exp(-1j * 2*np.pi*(cfo - 15)*t)).astype(np.complex64)
 def iq_to_packets(iq):
     peak = np.max(np.abs(iq))
     if peak < 5:
@@ -221,13 +226,11 @@ def iq_to_packets(iq):
                 raw = bytes(np.packbits(bits[:nb*8]))
                 pkt, crc_ok = parse_packet(raw, 0)
                 if pkt:
+                    seq = pkt['seq']
                     pkt['crc_ok'] = crc_ok
-                    found[pkt['seq']] = pkt
-                    break
-        
-        # If we found packets with this CFO, stop searching variants
-        if found:
-            break
+                    # If we haven't seen this packet, or the new one has a better CRC, keep it!
+                    if seq not in found or (crc_ok and not found[seq]['crc_ok']):
+                        found[seq] = pkt
     
     # Return sorted by sequence number
     return [found[k] for k in sorted(found.keys())]
