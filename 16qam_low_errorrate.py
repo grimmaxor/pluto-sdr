@@ -223,67 +223,67 @@ def iq_to_packets(iq):
             phi   = np.angle(corr[c])
             derot = np.exp(-1j * phi)
 
-                # Amplitude Recovery (critical for 16QAM)
-                chan_gain = mag[c] / PREAMBLE_LEN
-                if chan_gain < 1e-6:
-                    continue
+            # Amplitude Recovery (critical for 16QAM)
+            chan_gain = mag[c] / PREAMBLE_LEN
+            if chan_gain < 1e-6:
+                continue
 
-                data_start = c + PREAMBLE_LEN
-                if len(stream[data_start:]) < 16:
-                    continue
+            data_start = c + PREAMBLE_LEN
+            if len(stream[data_start:]) < 16:
+                continue
 
-                for slip in (0, 1, -1, 2, -2):
-                    ss = data_start + slip
-                    if ss < 0 or ss >= len(stream):
-                        continue
+            for slip in (0, 1, -1, 2, -2):
+                ss = data_start + slip
+                if ss < 0 or ss >= len(stream):
+                    continue
+                
+                # Least-Squares Decision-Directed Equalizer
+                # 16QAM requires exact phase and amplitude. By tracking it every 64 symbols,
+                # we can aggressively cancel out any oscillator phase noise and RF fading!
+                ds = stream[ss:]
+                decoded_bits = []
+                cur_derot = derot
+                cur_gain = chan_gain
+                block_size = 64
+                
+                for i in range(0, len(ds), block_size):
+                    chunk = ds[i:i+block_size]
+                    norm_chunk = chunk * cur_derot / cur_gain
+                    chunk_bits = symbols_to_bits(norm_chunk)
+                    decoded_bits.append(chunk_bits)
                     
-                    # Least-Squares Decision-Directed Equalizer
-                    # 16QAM requires exact phase and amplitude. By tracking it every 64 symbols,
-                    # we can aggressively cancel out any oscillator phase noise and RF fading!
-                    ds = stream[ss:]
-                    decoded_bits = []
-                    cur_derot = derot
-                    cur_gain = chan_gain
-                    block_size = 64
-                    
-                    for i in range(0, len(ds), block_size):
-                        chunk = ds[i:i+block_size]
-                        norm_chunk = chunk * cur_derot / cur_gain
-                        chunk_bits = symbols_to_bits(norm_chunk)
-                        decoded_bits.append(chunk_bits)
+                    if len(chunk) > 16:
+                        ideal = bits_to_symbols(chunk_bits)
                         
-                        if len(chunk) > 16:
-                            ideal = bits_to_symbols(chunk_bits)
+                        # Least-Squares Phase & Amplitude Estimate
+                        # Weighting by conj(ideal) naturally gives higher-power (outer) 
+                        # constellation points more influence, which have better SNR!
+                        corr_ls = np.sum(chunk * np.conj(ideal))
+                        
+                        # 1. Update Phase
+                        cur_derot = np.exp(-1j * np.angle(corr_ls))
+                        
+                        # 2. Update Amplitude (Gain)
+                        power_ideal = np.sum(np.abs(ideal)**2)
+                        if power_ideal > 0.1:
+                            measured_gain = np.abs(corr_ls) / power_ideal
+                            # Alpha filter to prevent aggressive bouncing
+                            cur_gain = 0.8 * cur_gain + 0.2 * measured_gain
                             
-                            # Least-Squares Phase & Amplitude Estimate
-                            # Weighting by conj(ideal) naturally gives higher-power (outer) 
-                            # constellation points more influence, which have better SNR!
-                            corr_ls = np.sum(chunk * np.conj(ideal))
-                            
-                            # 1. Update Phase
-                            cur_derot = np.exp(-1j * np.angle(corr_ls))
-                            
-                            # 2. Update Amplitude (Gain)
-                            power_ideal = np.sum(np.abs(ideal)**2)
-                            if power_ideal > 0.1:
-                                measured_gain = np.abs(corr_ls) / power_ideal
-                                # Alpha filter to prevent aggressive bouncing
-                                cur_gain = 0.8 * cur_gain + 0.2 * measured_gain
-                                
-                    if not decoded_bits:
-                        continue
-                    bits = np.concatenate(decoded_bits)
-                    nb   = len(bits) // 8
-                    if nb < 10:
-                        continue
-                    raw = bytes(np.packbits(bits[:nb*8]))
-                    pkt, crc_ok = parse_packet(raw, 0)
-                    if pkt:
-                        seq = pkt['seq']
-                        pkt['crc_ok'] = crc_ok
-                        # If we haven't seen this packet, or the new one has a better CRC, keep it!
-                        if seq not in found or (crc_ok and not found[seq]['crc_ok']):
-                            found[seq] = pkt
+                if not decoded_bits:
+                    continue
+                bits = np.concatenate(decoded_bits)
+                nb   = len(bits) // 8
+                if nb < 10:
+                    continue
+                raw = bytes(np.packbits(bits[:nb*8]))
+                pkt, crc_ok = parse_packet(raw, 0)
+                if pkt:
+                    seq = pkt['seq']
+                    pkt['crc_ok'] = crc_ok
+                    # If we haven't seen this packet, or the new one has a better CRC, keep it!
+                    if seq not in found or (crc_ok and not found[seq]['crc_ok']):
+                        found[seq] = pkt
     
     # Return sorted by sequence number
     return [found[k] for k in sorted(found.keys())]
