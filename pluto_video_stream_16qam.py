@@ -114,19 +114,21 @@ def build_packet(seq, payload):
 def parse_packet(raw, start):
     HDR = 7
     if start + HDR > len(raw):
-        return None
+        return None, False
     magic, seq, plen = struct.unpack('>BIH', raw[start:start+HDR])
-    if magic != MAGIC:
-        return None
+    if magic != MAGIC or plen > 2048:  # bound plen to avoid garbage length
+        return None, False
     end = start + HDR + plen + 4
     if end > len(raw):
-        return None
+        return None, False
     payload  = raw[start+HDR : start+HDR+plen]
     crc_rx   = struct.unpack('>I', raw[start+HDR+plen : end])[0]
     crc_calc = zlib.crc32(raw[start:start+HDR+plen]) & 0xFFFFFFFF
-    if crc_rx != crc_calc:
-        return None
-    return {'seq': seq, 'payload': payload}
+    
+    # For live video, DO NOT drop the packet if CRC fails! 
+    # Let ffplay handle the bit errors (causes static, but prevents freezing).
+    crc_ok = (crc_rx == crc_calc)
+    return {'seq': seq, 'payload': payload}, crc_ok
 
 
 # ─── TX MODULATION ────────────────────────────────────────────────────────────
@@ -217,8 +219,9 @@ def iq_to_packets(iq):
                 if nb < 10:
                     continue
                 raw = bytes(np.packbits(bits[:nb*8]))
-                pkt = parse_packet(raw, 0)
+                pkt, crc_ok = parse_packet(raw, 0)
                 if pkt:
+                    pkt['crc_ok'] = crc_ok
                     found[pkt['seq']] = pkt
                     break
         
@@ -413,6 +416,7 @@ def receiver_main(sdr):
     
     pkts_rx = 0
     bytes_rx = 0
+    crc_fails = 0
     last_seq = -1
     start_time = time.time()
     
@@ -431,10 +435,15 @@ def receiver_main(sdr):
                 seq = pkt['seq']
                 payload = pkt['payload']
                 
+                if not pkt.get('crc_ok', True):
+                    crc_fails += 1
+                
                 # Check for dropped packets
                 if last_seq != -1 and seq > last_seq + 1:
                     lost = seq - last_seq - 1
-                    sys.stdout.write(f"\n[RX] Warning: Lost {lost} packets (RF noise/fade)")
+                    # Only warn if it's a huge gap to prevent console spam
+                    if lost > 5:
+                        sys.stdout.write(f"\n[RX] Warning: Lost {lost} packets (RF noise/fade)")
                     
                 last_seq = seq
                 pkts_rx += 1
@@ -451,7 +460,8 @@ def receiver_main(sdr):
             if packets:
                 elapsed = time.time() - start_time
                 kbps = (bytes_rx * 8 / 1000) / max(elapsed, 0.1)
-                sys.stdout.write(f"\r[RX] Received: {pkts_rx} packets  Data: {bytes_rx/1e6:.2f} MB  Avg: {kbps:.1f} kbps   ")
+                err_rate = (crc_fails / max(pkts_rx, 1)) * 100
+                sys.stdout.write(f"\r[RX] Rcvd: {pkts_rx} pkts | Data: {bytes_rx/1e6:.2f} MB | {kbps:.1f} kbps | Bit-Errors: {err_rate:.1f}%   ")
                 sys.stdout.flush()
 
     except KeyboardInterrupt:
