@@ -416,6 +416,7 @@ def receiver_main(sdr):
     p = subprocess.Popen(ffplay_cmd, stdin=subprocess.PIPE)
     
     print("[RX] Listening for 16QAM stream... (Ctrl+C to stop)")
+    print("[RX] ALSO saving stream to 'live_video.ts' in this folder!")
     
     pkts_rx = 0
     bytes_rx = 0
@@ -424,52 +425,56 @@ def receiver_main(sdr):
     start_time = time.time()
     
     try:
-        while True:
-            # Fetch a large chunk of IQ data
-            try:
-                raw = sdr.rx()
-            except OSError:
-                continue
-                
-            # Demodulate all packets in the buffer
-            packets = iq_to_packets(raw)
-            
-            for pkt in packets:
-                seq = pkt['seq']
-                payload = pkt['payload']
-                
-                if not pkt.get('crc_ok', True):
-                    crc_fails += 1
-                
-                # Check for dropped packets
-                if last_seq != -1 and seq > last_seq + 1:
-                    lost = seq - last_seq - 1
-                    # Only warn if it's a huge gap to prevent console spam
-                    if lost > 5:
-                        sys.stdout.write(f"\n[RX] Warning: Lost {lost} packets (RF noise/fade)")
-                    
-                last_seq = seq
-                pkts_rx += 1
-                bytes_rx += len(payload)
-                
-                # Pipe directly to ffplay
+        with open("live_video.ts", "wb") as f_out:
+            while True:
+                # Fetch a large chunk of IQ data
                 try:
-                    p.stdin.write(payload)
-                    p.stdin.flush()
-                except BrokenPipeError:
-                    print("\n[RX] ffplay closed.")
-                    return
-            
-            if packets:
-                elapsed = time.time() - start_time
-                kbps = (bytes_rx * 8 / 1000) / max(elapsed, 0.1)
-                err_rate = (crc_fails / max(pkts_rx, 1)) * 100
-                sys.stdout.write(f"\r[RX] Rcvd: {pkts_rx} pkts | Data: {bytes_rx/1e6:.2f} MB | {kbps:.1f} kbps | Bit-Errors: {err_rate:.1f}%   ")
-                sys.stdout.flush()
+                    raw = sdr.rx()
+                except OSError:
+                    continue
+                    
+                # Demodulate all packets in the buffer
+                packets = iq_to_packets(raw)
+                
+                for pkt in packets:
+                    seq = pkt['seq']
+                    payload = pkt['payload']
+                    
+                    if not pkt.get('crc_ok', True):
+                        crc_fails += 1
+                    
+                    # Check for dropped packets
+                    if last_seq != -1 and seq > last_seq + 1:
+                        lost = seq - last_seq - 1
+                        # Only warn if it's a huge gap to prevent console spam
+                        if lost > 5:
+                            sys.stdout.write(f"\n[RX] Warning: Lost {lost} packets (RF noise/fade)")
+                        
+                    last_seq = seq
+                    pkts_rx += 1
+                    bytes_rx += len(payload)
+                    
+                    # Write to file so user can play it if ffplay GUI fails
+                    f_out.write(payload)
+                    
+                    # Pipe directly to ffplay
+                    try:
+                        p.stdin.write(payload)
+                        p.stdin.flush()
+                    except BrokenPipeError:
+                        pass # Ignore broken pipe if ffplay closed, keep saving to file
+                
+                if packets:
+                    elapsed = time.time() - start_time
+                    kbps = (bytes_rx * 8 / 1000) / max(elapsed, 0.1)
+                    err_rate = (crc_fails / max(pkts_rx, 1)) * 100
+                    sys.stdout.write(f"\r[RX] Rcvd: {pkts_rx} pkts | Data: {bytes_rx/1e6:.2f} MB | {kbps:.1f} kbps | Bit-Errors: {err_rate:.1f}%   ")
+                    sys.stdout.flush()
 
     except KeyboardInterrupt:
         print("\n[RX] Interrupted by user.")
     finally:
+        print("\n[RX] Saved video to live_video.ts")
         p.stdin.close()
         p.kill()
 
