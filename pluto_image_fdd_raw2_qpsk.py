@@ -299,8 +299,12 @@ def packet_to_iq(pkt_bytes):
 
     syms = np.concatenate([preamble, payload]).astype(np.complex64)
 
-    up = np.zeros(len(syms) * SAMPLES_PER_SYMBOL, dtype=np.complex64)
-    up[::SAMPLES_PER_SYMBOL] = syms
+    # Pad with len(FILT) zeros after the last symbol impulse so the causal
+    # FIR filter has enough input runway to fully shape every symbol's pulse.
+    # Without this, the last ~4 symbols are truncated and their magnitudes
+    # drop to near-zero after the cascaded TX+RX filtering, corrupting them.
+    up = np.zeros(len(syms) * SAMPLES_PER_SYMBOL + len(FILT), dtype=np.complex64)
+    up[::SAMPLES_PER_SYMBOL][:len(syms)] = syms
     shaped_i = lfilter(FILT, 1.0, up.real).astype(np.float32)
     shaped_q = lfilter(FILT, 1.0, up.imag).astype(np.float32)
     shaped   = (shaped_i + 1j * shaped_q).astype(np.complex64)
