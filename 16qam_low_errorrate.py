@@ -189,79 +189,101 @@ def iq_to_packets(iq):
         filt = (fi + 1j * fq).astype(np.complex64)
         
         n = len(filt)
+        n = len(filt)
+        
+        # ── SYMBOL TIMING SYNCHRONIZATION ──
+        # Sweep all 16 sampling phases to find the EXACT peak of the eye diagram.
+        # This completely eliminates Inter-Symbol Interference (ISI).
+        best_toff = 0
+        max_peak = 0
         for toff in range(SAMPLES_PER_SYMBOL):
-            start = (delay + toff) % SAMPLES_PER_SYMBOL
-            stream = filt[start::SAMPLES_PER_SYMBOL]
-        if len(stream) < PREAMBLE_LEN + 32:
-            continue
+            stream = filt[(delay + toff) % SAMPLES_PER_SYMBOL :: SAMPLES_PER_SYMBOL]
+            if len(stream) < PREAMBLE_LEN:
+                continue
+            corr = np.correlate(stream, PREAMBLE_SIGNS.astype(np.complex64), mode='valid')
+            peak = np.max(np.abs(corr)) if len(corr) > 0 else 0
+            if peak > max_peak:
+                max_peak = peak
+                best_toff = toff
+                
+        if max_peak < PREAMBLE_LEN * 0.4:
+            continue  # No packets in this variant
             
+        # Now process ONLY the perfectly aligned stream!
+        start = (delay + best_toff) % SAMPLES_PER_SYMBOL
+        stream = filt[start::SAMPLES_PER_SYMBOL]
         corr = np.correlate(stream, PREAMBLE_SIGNS.astype(np.complex64), mode='valid')
         mag  = np.abs(corr)
-        thr  = PREAMBLE_LEN * 0.4    # lowered threshold for 16QAM peak-scaling
-        cand = np.where(mag > thr)[0]
+        
+        # Use find_peaks to grab the true peaks, ignoring the slopes of the bell curves
+        from scipy.signal import find_peaks
+        cand, _ = find_peaks(mag, height=PREAMBLE_LEN * 0.4, distance=500)
         
         for c in cand:
             phi   = np.angle(corr[c])
             derot = np.exp(-1j * phi)
 
-            # Amplitude Recovery (critical for 16QAM)
-            chan_gain = mag[c] / PREAMBLE_LEN
-            if chan_gain < 1e-6:
-                continue
-
-            data_start = c + PREAMBLE_LEN
-            if len(stream[data_start:]) < 16:
-                continue
-
-            for slip in (0, 1, -1, 2, -2):
-                ss = data_start + slip
-                if ss < 0 or ss >= len(stream):
+                # Amplitude Recovery (critical for 16QAM)
+                chan_gain = mag[c] / PREAMBLE_LEN
+                if chan_gain < 1e-6:
                     continue
-                
-                # Decision-Directed Phase & Gain Tracking!
-                # 16QAM is fragile over long packets. We slice the packet into 
-                # small 256-symbol blocks. For each block, we decode the symbols,
-                # then compare them to the 'ideal' constellation to calculate how
-                # much the SDR's phase or amplitude drifted, fixing the next block!
-                ds = stream[ss:]
-                decoded_bits = []
-                cur_derot = derot
-                cur_gain = chan_gain
-                block_size = 256
-                
-                for i in range(0, len(ds), block_size):
-                    chunk = ds[i:i+block_size]
-                    norm_chunk = chunk * cur_derot / cur_gain
-                    chunk_bits = symbols_to_bits(norm_chunk)
-                    decoded_bits.append(chunk_bits)
+
+                data_start = c + PREAMBLE_LEN
+                if len(stream[data_start:]) < 16:
+                    continue
+
+                for slip in (0, 1, -1, 2, -2):
+                    ss = data_start + slip
+                    if ss < 0 or ss >= len(stream):
+                        continue
                     
-                    if len(chunk) > 32:
-                        ideal = bits_to_symbols(chunk_bits)
+                    # Least-Squares Decision-Directed Equalizer
+                    # 16QAM requires exact phase and amplitude. By tracking it every 64 symbols,
+                    # we can aggressively cancel out any oscillator phase noise and RF fading!
+                    ds = stream[ss:]
+                    decoded_bits = []
+                    cur_derot = derot
+                    cur_gain = chan_gain
+                    block_size = 64
+                    
+                    for i in range(0, len(ds), block_size):
+                        chunk = ds[i:i+block_size]
+                        norm_chunk = chunk * cur_derot / cur_gain
+                        chunk_bits = symbols_to_bits(norm_chunk)
+                        decoded_bits.append(chunk_bits)
                         
-                        # Estimate the true phase of the channel during this block
-                        phase_meas = np.angle(np.mean(chunk * np.conj(ideal)))
-                        cur_derot = np.exp(-1j * phase_meas)
-                        
-                        # Estimate the true gain of the channel
-                        mean_ideal_amp = np.mean(np.abs(ideal))
-                        if mean_ideal_amp > 0.1:
-                            measured_gain = np.mean(np.abs(chunk)) / mean_ideal_amp
-                            cur_gain = 0.5 * cur_gain + 0.5 * measured_gain
+                        if len(chunk) > 16:
+                            ideal = bits_to_symbols(chunk_bits)
                             
-                if not decoded_bits:
-                    continue
-                bits = np.concatenate(decoded_bits)
-                nb   = len(bits) // 8
-                if nb < 10:
-                    continue
-                raw = bytes(np.packbits(bits[:nb*8]))
-                pkt, crc_ok = parse_packet(raw, 0)
-                if pkt:
-                    seq = pkt['seq']
-                    pkt['crc_ok'] = crc_ok
-                    # If we haven't seen this packet, or the new one has a better CRC, keep it!
-                    if seq not in found or (crc_ok and not found[seq]['crc_ok']):
-                        found[seq] = pkt
+                            # Least-Squares Phase & Amplitude Estimate
+                            # Weighting by conj(ideal) naturally gives higher-power (outer) 
+                            # constellation points more influence, which have better SNR!
+                            corr_ls = np.sum(chunk * np.conj(ideal))
+                            
+                            # 1. Update Phase
+                            cur_derot = np.exp(-1j * np.angle(corr_ls))
+                            
+                            # 2. Update Amplitude (Gain)
+                            power_ideal = np.sum(np.abs(ideal)**2)
+                            if power_ideal > 0.1:
+                                measured_gain = np.abs(corr_ls) / power_ideal
+                                # Alpha filter to prevent aggressive bouncing
+                                cur_gain = 0.8 * cur_gain + 0.2 * measured_gain
+                                
+                    if not decoded_bits:
+                        continue
+                    bits = np.concatenate(decoded_bits)
+                    nb   = len(bits) // 8
+                    if nb < 10:
+                        continue
+                    raw = bytes(np.packbits(bits[:nb*8]))
+                    pkt, crc_ok = parse_packet(raw, 0)
+                    if pkt:
+                        seq = pkt['seq']
+                        pkt['crc_ok'] = crc_ok
+                        # If we haven't seen this packet, or the new one has a better CRC, keep it!
+                        if seq not in found or (crc_ok and not found[seq]['crc_ok']):
+                            found[seq] = pkt
     
     # Return sorted by sequence number
     return [found[k] for k in sorted(found.keys())]
