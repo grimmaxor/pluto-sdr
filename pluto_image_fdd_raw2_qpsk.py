@@ -667,10 +667,19 @@ def confirm_link(sdr, label, atten):
 
 
 def calibrate(sdr, label):
+    global MOD, BITS_PER_SYMBOL
     print(f"\n{'='*54}\n  ROLE {label} — FDD auto-calibration (runs on both)\n{'='*54}")
-    rx_gain  = calibrate_rx_gain(sdr, label)
-    tx_atten = calibrate_tx_power(sdr, label)
-    confirm_link(sdr, label, tx_atten)
+    # Cal beacons/demod always use BPSK regardless of --mod: CAL_TX_ATTEN=-30 dB is
+    # tuned for BPSK robustness and QPSK needs ~3 dB more SNR to decode at that level.
+    saved_mod, saved_bps = MOD, BITS_PER_SYMBOL
+    MOD, BITS_PER_SYMBOL = 'bpsk', 1
+    print(f"[{label}] Using BPSK for calibration (payload will use {saved_mod.upper()})")
+    try:
+        rx_gain  = calibrate_rx_gain(sdr, label)
+        tx_atten = calibrate_tx_power(sdr, label)
+        confirm_link(sdr, label, tx_atten)
+    finally:
+        MOD, BITS_PER_SYMBOL = saved_mod, saved_bps
     print(f"\n[{label}] Calibration result: RX gain {rx_gain} dB, TX atten {tx_atten} dB")
     return rx_gain, tx_atten
 
