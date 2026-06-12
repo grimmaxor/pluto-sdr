@@ -139,7 +139,7 @@ BLOCK_CHUNKS       = 200             # packets per block (~BLOCK_CHUNKS*CHUNK_BY
 MAX_REQ_SEQS       = 50
 
 # Calibration (symmetric FDD — both radios run it concurrently before transfer).
-CAL_TX_ATTEN       = -30            # TX power while sweeping RX gain
+CAL_TX_ATTEN       = -10            # TX power while sweeping RX gain
 GAIN_STEP_BUFS     = 6             # rx() captures averaged per gain step
 GAIN_CONFIRM       = 2             # decodes needed to accept a gain step
 GAIN_RETRIES       = 8             # whole-sweep retries if partner not heard yet
