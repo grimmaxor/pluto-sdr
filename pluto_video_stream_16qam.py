@@ -49,8 +49,9 @@ ap.add_argument('--input',     type=str,   default=None, help='tx: input video f
 ap.add_argument('--bitrate',   type=str,   default='120k', help='tx: video bitrate (e.g. 120k)')
 ap.add_argument('--sps',       type=int,   default=16, help='samples per symbol')
 ap.add_argument('--chunk',     type=int,   default=1024, help='bytes per packet')
-ap.add_argument('--rx-gain',   type=int,   default=40, help='RX hardware gain')
+ap.add_argument('--rx-gain',   type=int,   default=40, help='RX hardware gain (used if --skip-cal)')
 ap.add_argument('--tx-atten',  type=int,   default=-20, help='TX hardware attenuation')
+ap.add_argument('--skip-cal',  action='store_true', help='rx: skip auto-calibration')
 args = ap.parse_args()
 
 ROLE = args.role
@@ -254,6 +255,57 @@ def setup_pluto():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  AUTO-CALIBRATION (RX Only for Simplex Link)
+# ═══════════════════════════════════════════════════════════════════════════════
+def auto_calibrate_rx(sdr):
+    print("\n[*] Starting RX Auto-Calibration ...")
+    print("    (Make sure the TX side is already running and streaming video)")
+    print(f"  {'Gain':>5}  {'Peak':>6}  {'ADC%':>5}  {'Decodes':>7}")
+    candidates = []
+    
+    # Sweep from 0 to 71 in steps of 5
+    for g in range(0, 75, 5):
+        if g > 71: g = 71
+        
+        try:
+            sdr.rx_hardwaregain_chan0 = g
+        except OSError:
+            continue
+            
+        # Flush old buffers
+        for _ in range(2): 
+            try: sdr.rx() 
+            except: pass
+            
+        pk = 0
+        dec = 0
+        for _ in range(3):
+            try:
+                rx = sdr.rx()
+                pk = max(pk, np.max(np.abs(rx)))
+                if len(iq_to_packets(rx)) > 0:
+                    dec += 1
+            except:
+                pass
+                
+        adc = pk / 2896 * 100
+        print(f"  {g:>5}  {pk:>6.0f}  {adc:>4.0f}%  {dec:>7}")
+        
+        if adc > 95:  # ADC clipping — reject this step
+            continue
+        if dec > 0:
+            candidates.append(g)
+            
+    if candidates:
+        best = max(candidates)
+        print(f"[*] Calibration complete. Settling on best RX Gain: {best} dB\n")
+        sdr.rx_hardwaregain_chan0 = best
+    else:
+        print("[!] Calibration failed to find a working gain. Falling back to default.")
+        sdr.rx_hardwaregain_chan0 = args.rx_gain
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  SENDER (Pluto 1)
 # ═══════════════════════════════════════════════════════════════════════════════
 def sender_main(sdr):
@@ -338,6 +390,9 @@ def sender_main(sdr):
 #  RECEIVER (Pluto 2)
 # ═══════════════════════════════════════════════════════════════════════════════
 def receiver_main(sdr):
+    if not args.skip_cal:
+        auto_calibrate_rx(sdr)
+        
     print("[*] Starting ffplay for live video playback ...")
     
     # ffplay reads from our stdin. We tell it to expect an mpegts stream,
