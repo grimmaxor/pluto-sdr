@@ -114,6 +114,25 @@ python solo_pyth/pluto_dvbt2.py --rx [--freq 2.4e9] [--uri ip:192.168.2.1] [--ga
 #   RX prints [diag] every 5 s: peak | syms | bits_buf | ts_out | sync — ts_out>0 means packets decoded
 #   RX reedsolo must be installed in the correct venv: .venv/bin/python3.11 -m pip install reedsolo
 
+# Simplex 16QAM live video streaming — no ARQ, no FEC (basic version)
+python solo_pyth/pluto_video_stream_16qam.py --role tx --input my_video.mp4  # or /dev/video0
+python solo_pyth/pluto_video_stream_16qam.py --role rx
+
+# Same but with decision-directed LS equalizer (lower error rate, still no FEC)
+python solo_pyth/16qam_low_errorrate.py --role tx --input my_video.mp4
+python solo_pyth/16qam_low_errorrate.py --role rx
+
+# Most stable 16QAM streaming — RRC filter + RS FEC (RS_PARITY=32) + LS equalizer
+python solo_pyth/pluto_video_stream_16qam_stable.py --role tx --input my_video.mp4
+python solo_pyth/pluto_video_stream_16qam_stable.py --role rx
+#   self-test (no hardware needed):  --role test
+
+# 256QAM streaming — highest throughput, best-SNR links only, no FEC/ARQ
+python solo_pyth/pluto_video_stream_256qam.py --role tx --input my_video.mp4
+python solo_pyth/pluto_video_stream_256qam.py --role rx
+#   All video stream scripts: --freq (default 2412e6), --bitrate (default 120k), --sps (default 16)
+#   Prerequisites: ffmpeg + ffplay installed on both machines
+
 # GNU Radio path — start the matching .grc flowgraph first, then:
 python GNU/tx_arq_fec.py      # sends file as UDP to the flowgraph (RS FEC + ARQ)
 python GNU/rx_arq_fec.py      # receives demodulated UDP from the flowgraph
@@ -213,10 +232,41 @@ debugging link reliability.
 | `pluto_link_debug.py` | FDD | **FDD link diagnostic tool.** Run on both PCs simultaneously (`--role tx` on Linux, `--role rx` on Windows). Phase 1 tests the DATA channel (Linux→Windows); Phase 2 tests the CTRL channel (Windows→Linux — the likely failure point). Sweeps TX attenuation at each level, counts decoded packets, and prints a diagnosis with recommended fixes. Also has `--quick` mode: 30-second passive sniff with no TX, reports raw signal amplitude and correlation peak even when packets don't decode (distinguishes "no RF" from "RF present but can't decode"). |
 | `pluto_dvbt_video.py` | FDD | **DVB-T live video streaming (GNU Radio variant).** Third architectural pattern — **not** pure pyadi-iio. Uses **GNU Radio Python bindings inline** (`gr.top_block` subclasses). TX (Windows): GStreamer → UDP:2000 → GR DVB-T encode → `iio.fmcomms2_sink_fc32`. RX (Linux): `iio.fmcomms2_source_fc32` → GR DVB-T decode → UDP:2001 → GStreamer. T2k/QPSK/C7_8, 3.2 MSPS. Requires `gnuradio`, `gnuradio-dtv`. |
 | `pluto_dvbt2.py` | FDD | **DVB-T live video streaming (no GNU Radio).** Same protocol as `pluto_dvbt_video.py` but implements the **full DVB-T T2k/QPSK/C7_8 chain in pure Python/NumPy** — no `gnuradio` import. TX: GStreamer (UDP:2000) → energy dispersal → RS(204,188) → Forney interleaver → rate-7/8 punctured conv encoder → bit/symbol inner interleavers → QPSK map → pilot insertion + IFFT → cyclic prefix → pyadi-iio Pluto. RX: pyadi-iio → Schmidl-Cox OFDM timing+CFO → FFT → pilot-based channel eq → QPSK demap → symbol/bit deinterleavers → Viterbi(C7/8) → Forney deinterleaver → RS decode → energy descramble → UDP:2001 → GStreamer. All DVB-T tables generated from ETSI EN 300 744. Dependencies: `pyadi-iio`, `numpy`, `reedsolo`, GStreamer. **Includes BPSK symmetric FDD auto-calibration** (`calibrate_dvbt()`, `--skip-cal` to skip). **Bugs fixed this session:** (1) `RSCodec(nroots=...)` → `RSCodec(nsym=...)` — reedsolo 1.7.0 dropped the `nroots` kwarg; (2) `np.interp` on complex channel estimates → split real/imaginary interpolation; (3) interleaver direction — both `symbol_inner_deinterleave` and `bit_inner_deinterleave` used inverse-permutation scatter instead of forward gather (`c[R]` not `out[R]=c`); (4) inter-buffer sample loss — `DvbtDecoder._carry` preserves leftover samples across `push_samples` calls so OFDM symbol boundaries stay aligned; (5) Windows GStreamer not on PATH — `_find_gst_launch()` searches `C:\gstreamer\1.0\...\bin\`. **Status (2026-06-12):** loopback perfect (`pscore=0.999`, byte-exact); on air `sync=YES` but `frame=NO`, `pscore≈0.85`, `ts_out=0`. Narrowed offline to the **integer-CFO acquisition locking a wrong alias** — continual-pilot coherence truly peaks at `shift≈+83` but the decoder locks `≈−60`, where pilots partially cohere (`pscore≈0.85`) yet equalized data EVM ≈ 1.0 (noise). See the root `CLAUDE.md` dvbt2 deep-dive for the full diagnosis, the `_rx_*` offline harness, and the next step. Real-time playback also blocked separately by the slow pure-Python Viterbi. |
+| `pluto_video_stream_16qam.py` | simplex | **Simplex 16QAM live video streaming — baseline.** Uses ffmpeg to encode a video file or webcam (`/dev/video0`) into a low-bitrate MPEG-TS stream and transmits continuously as 16QAM packets; RX pipes decoded MPEG-TS to ffplay. **No ARQ, no FEC** — corrupted packets are dropped (brief glitch until next I-frame). BPSK Barker×3 preamble. 4th-power FFT CFO + ±15 Hz micro-offset sweep. Brute-force symbol timing sweep over all SPS phases. No amplitude recovery. `--role tx/rx`, `--input file_or_device`. Requires ffmpeg + ffplay. |
+| `16qam_low_errorrate.py` | simplex | **Decision-directed 16QAM streaming.** Same simplex video streaming as `video_stream_16qam.py` but adds a **least-squares decision-directed equalizer**: every 64 symbols, hard-decodes to nearest 16QAM point, forms `Σ(rx·conj(ideal))` for a joint phase+amplitude estimate, and updates the running derotation and gain. Outer constellation points (±3) carry more power → higher natural weight in the LS sum. No FEC, no ARQ. |
+| `pluto_video_stream_16qam_stable.py` | simplex | **Most stable 16QAM video streaming.** Builds on the LS equalizer with: **(1) RRC filter** (α=0.35, 12×SPS span) for zero ISI; **(2) RS FEC** (`RS_PARITY=32` bytes per ≤223-byte chunk — payload+CRC32 wrapped in RS codeword, header unencoded); **(3) MAGIC fast-abort** — decode 1 block, check MAGIC + extract plen, compute `rs_encoded_len(plen+4)` → decode exactly `ceil((7+enc_len)*8/4)+8` symbols (not the full buffer); **(4) `find_peaks` candidate de-sidelobe** — replaces `np.where(mag>THR)` with `find_peaks(mag, height=THR, distance=PREAMBLE_LEN//2)` so each packet's correlation lobe gives 1 candidate instead of ~5. CHUNK_BYTES=512. `--role test` for offline self-test. RX saves to `live_video_stable.ts`. **Status (2026-06-15): offline loopback correct (RS decode, CRC pass, payload exact match). Real-time RX still 3.3× slower than budget** (0.524s buffer takes 1.7s) — see debug notes below. |
+| `pluto_video_stream_256qam.py` | simplex | **256QAM simplex video streaming.** Same architecture as `video_stream_16qam.py` but 256QAM (8 bits/symbol — 4 bits per I/Q axis, 16 Gray-coded levels, scale factor √170). Highest throughput; requires best SNR. No FEC, no ARQ. |
 
 When unifying toward the Python-only goal, the `_auto_qpsk` filelink and `_fdd_diag` image
 transfer are the most evolved endpoints of their respective lineages. `pluto_dvbt2.py` is the
 no-GNU-Radio DVB-T video path; `pluto_dvbt_video.py` is retained as a reference.
+
+## `pluto_video_stream_16qam_stable.py` — RX performance debug (2026-06-15)
+
+**Root cause of RX hang**: `iq_to_packets` was 14.5× slower than real-time on a buffer full of real packets. The RX loop got a buffer, called `iq_to_packets`, which took 7.6s on a 0.524s buffer, so only one buffer was ever processed.
+
+**Why it was slow (original code)**:
+- `np.where(mag > 0.75×39)` produced ~137 candidates per toff (each packet's preamble correlation lobe spans ~5 adjacent samples, all above threshold)
+- The LS equalizer then ran on `ds = stream[ss:]` — the **entire rest of the stream** (~32K symbols) for every candidate
+- 16 toffs × 137 candidates × 5 slips × 32K symbols = ~355M symbol operations per CFO variant × 4 = enormous
+
+**Fixes applied (in `iq_to_packets`)**:
+1. **Exact-length decode**: after the MAGIC fast-abort, read `plen` from the header bits (already decoded in the first 64-symbol block), compute `enc_len = rs_encoded_len(plen+4)`, then trim `ds` to `ceil((7+enc_len)*8/4)+8` symbols — only what this one packet needs, not the entire buffer tail.
+2. **`find_peaks` de-sidelobe**: replaced `np.where(mag > THR)` with `find_peaks(mag, height=THR, distance=PREAMBLE_LEN//2)` to collapse each packet's correlation lobe to a single candidate (25 candidates instead of 137 per toff).
+3. **All 16 toffs still processed**: tried a "best_toff" pre-scan first — failed because the RRC filter (α=0.35) makes all 16 timing phases give nearly equal correlation peak (within 1%), so any one toff selected by peak-picking is essentially random and misses ~56% of packets.
+
+**Current state after fixes**: 1.71s per buffer, 3.3× slower than real-time. Loopback passes (RS decode, CRC, payload exact match).
+
+**Profiling result**: `lfilter` (193-tap RRC, 524288 samples, ×8 calls) = 0.096s. `oaconvolve` (same, ×4 complex calls) = 0.045s. **Next step: replace the two real `lfilter` calls with one complex `oaconvolve` call per CFO variant** — estimated to bring filter cost from ~0.1s to ~0.045s per variant, targeting maybe 1.5× real-time total. Use `.venv/bin/python3.11` with `LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libiio.so.0.23` to run.
+
+**Offline test scripts** (use `.venv/bin/python3.11` with `LD_PRELOAD`):
+```bash
+# Loopback correctness (no radio)
+python3 /tmp/loopback_stable.py
+# 25-packet throughput benchmark
+python3 /tmp/bench_stable.py
+```
+These scripts are in `/tmp` — recreate them from the session if lost (they exec stable file with mocked args and feed synthetic IQ).
 
 ## `GNU/` — the UDP bridge to a GNU Radio flowgraph
 

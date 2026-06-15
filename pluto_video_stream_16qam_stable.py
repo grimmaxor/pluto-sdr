@@ -27,7 +27,7 @@ import struct
 import zlib
 import subprocess
 import time
-from scipy.signal import lfilter
+from scipy.signal import lfilter, find_peaks, oaconvolve
 from reedsolo import RSCodec
 
 # ─── CLI ──────────────────────────────────────────────────────────────────────
@@ -83,9 +83,9 @@ def rrcosfilter(N, alpha, Ts, Fs):
 
 FILT = rrcosfilter(SAMPLES_PER_SYMBOL * 12 + 1, 0.35, 1, SAMPLES_PER_SYMBOL)
 
-# 16QAM Gray Map
-_GRAY_MAP = {(0,0): -3, (0,1): -1, (1,1): +1, (1,0): +3}
-_GRAY_INV = {v: k for k, v in _GRAY_MAP.items()}
+# 16QAM Gray Map — vectorized via LUT (index = msb*2+lsb → level)
+# (0,0)→-3  (0,1)→-1  (1,0)→+3  (1,1)→+1
+_GRAY_LUT = np.array([-3, -1, 3, 1], dtype=np.float32)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  DSP
@@ -94,9 +94,9 @@ def bits_to_symbols(bits):
     pad = (-len(bits)) % 4
     if pad:
         bits = np.concatenate([bits, np.zeros(pad, dtype=bits.dtype)])
-    b = bits.reshape(-1, 4)
-    i_levels = np.array([_GRAY_MAP[(int(r[0]), int(r[1]))] for r in b], dtype=np.float32)
-    q_levels = np.array([_GRAY_MAP[(int(r[2]), int(r[3]))] for r in b], dtype=np.float32)
+    b = bits.reshape(-1, 4).astype(np.uint8)
+    i_levels = _GRAY_LUT[b[:, 0] * 2 + b[:, 1]]
+    q_levels = _GRAY_LUT[b[:, 2] * 2 + b[:, 3]]
     return ((i_levels + 1j * q_levels) / np.sqrt(10)).astype(np.complex64)
 
 
@@ -104,10 +104,9 @@ def symbols_to_bits(syms):
     s = syms * np.sqrt(10)
     def demap_axis(v):
         lv = np.clip(np.round((v + 3) / 2).astype(int) * 2 - 3, -3, 3)
-        out = np.zeros((len(v), 2), dtype=np.uint8)
-        for k in range(len(lv)):
-            out[k] = _GRAY_INV[int(lv[k])]
-        return out
+        msb = (lv > 0).astype(np.uint8)
+        lsb = (np.abs(lv) == 1).astype(np.uint8)
+        return np.stack([msb, lsb], axis=1)
     bi = demap_axis(s.real)
     bq = demap_axis(s.imag)
     return np.column_stack([bi[:, 0], bi[:, 1], bq[:, 0], bq[:, 1]]).reshape(-1)
@@ -209,63 +208,84 @@ def iq_to_packets(iq):
     iq = (iq / peak).astype(np.complex64)
     found = {}
     delay = len(FILT) // 2
+    block_size = 64
+    THR = PREAMBLE_LEN * 0.60
+    preamble_c64 = PREAMBLE_SIGNS.astype(np.complex64)
 
     for corrected_iq in _cfo_variants(iq):
-        # Matched RRC Filter
-        fi = lfilter(FILT, 1.0, corrected_iq.real).astype(np.float32)
-        fq = lfilter(FILT, 1.0, corrected_iq.imag).astype(np.float32)
-        filt = (fi + 1j * fq).astype(np.complex64)
-        
+        filt = oaconvolve(corrected_iq, FILT.astype(np.complex64),
+                          mode='full')[:len(corrected_iq)].astype(np.complex64)
+
+        # Try all SPS timing phases.  With RRC filtering every phase gives a
+        # similar correlation peak, so we cannot reliably pick just one.
+        # Exact-length decode (below) keeps the per-candidate work bounded.
         for toff in range(SAMPLES_PER_SYMBOL):
-            start_idx = delay + toff
-            stream = filt[start_idx::SAMPLES_PER_SYMBOL]
-            
+            stream = filt[delay + toff :: SAMPLES_PER_SYMBOL]
             if len(stream) < PREAMBLE_LEN + 32:
                 continue
-                
-            corr = np.correlate(stream, PREAMBLE_SIGNS.astype(np.complex64), mode='valid')
-            mag  = np.abs(corr)
-            thr  = PREAMBLE_LEN * 0.4
-            cand = np.where(mag > thr)[0]
-            
-            for c in cand:
-                phi   = np.angle(corr[c])
-                derot = np.exp(-1j * phi)
 
+            corr = np.correlate(stream, preamble_c64, mode='valid')
+            mag  = np.abs(corr)
+            if np.max(mag) < THR:
+                continue
+            # find_peaks keeps only local maxima separated by ≥PREAMBLE_LEN//2,
+            # collapsing each packet's correlation lobe to a single candidate.
+            cand, _ = find_peaks(mag, height=THR, distance=PREAMBLE_LEN // 2)
+
+            for c in cand:
+                phi       = np.angle(corr[c])
+                derot     = np.exp(-1j * phi)
                 chan_gain = mag[c] / PREAMBLE_LEN
                 if chan_gain < 1e-6:
                     continue
 
                 data_start = c + PREAMBLE_LEN
-                if len(stream[data_start:]) < 16:
+                if len(stream) - data_start < block_size:
                     continue
 
                 for slip in (0, 1, -1, 2, -2):
                     ss = data_start + slip
                     if ss < 0 or ss >= len(stream):
                         continue
-                    
+
                     ds = stream[ss:]
+
+                    # Fast-abort: decode one block and verify MAGIC + extract plen.
+                    fast_bits = symbols_to_bits(ds[:block_size] * derot / chan_gain)
+                    if len(fast_bits) < 56:
+                        continue
+                    if bytes(np.packbits(fast_bits[:8]))[0] != MAGIC:
+                        continue
+                    hdr_bytes = bytes(np.packbits(fast_bits[:56]))
+                    _, _, hdr_plen = struct.unpack('>BIH', hdr_bytes)
+                    if hdr_plen > 2048:
+                        continue
+
+                    # Exact-length decode: only run the LS equalizer over this
+                    # packet's symbols, not the rest of the buffer.
+                    enc_len    = rs_encoded_len(hdr_plen + 4)
+                    total_syms = -(-((7 + enc_len) * 8) // 4) + 8  # ceil + margin
+                    ds_pkt     = ds[:total_syms]
+
                     decoded_bits = []
-                    cur_derot = derot
-                    cur_gain = chan_gain
-                    block_size = 64
-                    
-                    for i in range(0, len(ds), block_size):
-                        chunk = ds[i:i+block_size]
+                    cur_derot    = derot
+                    cur_gain     = chan_gain
+
+                    for i in range(0, len(ds_pkt), block_size):
+                        chunk      = ds_pkt[i:i+block_size]
                         norm_chunk = chunk * cur_derot / cur_gain
                         chunk_bits = symbols_to_bits(norm_chunk)
                         decoded_bits.append(chunk_bits)
-                        
+
                         if len(chunk) > 16:
-                            ideal = bits_to_symbols(chunk_bits)
-                            corr_ls = np.sum(chunk * np.conj(ideal))
-                            cur_derot = np.exp(-1j * np.angle(corr_ls))
+                            ideal       = bits_to_symbols(chunk_bits)
+                            corr_ls     = np.sum(chunk * np.conj(ideal))
+                            cur_derot   = np.exp(-1j * np.angle(corr_ls))
                             power_ideal = np.sum(np.abs(ideal)**2)
                             if power_ideal > 0.1:
                                 measured_gain = np.abs(corr_ls) / power_ideal
                                 cur_gain = 0.8 * cur_gain + 0.2 * measured_gain
-                                
+
                     if not decoded_bits:
                         continue
                     bits = np.concatenate(decoded_bits)
@@ -279,7 +299,7 @@ def iq_to_packets(iq):
                         pkt['crc_ok'] = crc_ok
                         if seq not in found or (crc_ok and not found[seq]['crc_ok']):
                             found[seq] = pkt
-                            
+
     return [found[k] for k in sorted(found.keys())]
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -340,42 +360,59 @@ def auto_calibrate_rx(sdr):
     print("    (Make sure the TX side is already running and streaming video)")
     print(f"  {'Gain':>5}  {'Peak':>6}  {'ADC%':>5}  {'Decodes':>7}")
     candidates = []
-    
+
+    # Phase 1: fast ADC-level sweep — find non-saturating gains
+    good_gains = []
     for g in range(0, 75, 5):
         if g > 71: g = 71
         try: sdr.rx_hardwaregain_chan0 = g
         except OSError: continue
-            
-        for _ in range(2): 
-            try: sdr.rx() 
+        for _ in range(2):
+            try: sdr.rx()
             except: pass
-            
-        pk = 0
+        try:
+            rx = sdr.rx()
+            pk = np.max(np.abs(rx))
+            adc = pk / 2896 * 100
+            print(f"  {g:>5}  {pk:>6.0f}  {adc:>4.0f}%  {'(scan)':>7}")
+            if 5 < adc < 95:   # usable ADC range: not noise-floor, not clipping
+                good_gains.append((g, pk))
+        except: pass
+
+    if not good_gains:
+        print("[!] No signal found during ADC scan. Falling back to default gain.")
+        sdr.rx_hardwaregain_chan0 = args.rx_gain
+        return
+
+    # Phase 2: try full packet decode only on promising gains (highest first)
+    for g, _ in sorted(good_gains, reverse=True):
+        try: sdr.rx_hardwaregain_chan0 = g
+        except OSError: continue
+        for _ in range(2):
+            try: sdr.rx()
+            except: pass
         dec = 0
-        for _ in range(3):
+        pk = 0
+        for _ in range(2):
             try:
                 rx = sdr.rx()
                 pk = max(pk, np.max(np.abs(rx)))
                 if len(iq_to_packets(rx)) > 0:
                     dec += 1
-            except:
-                pass
-                
+            except: pass
         adc = pk / 2896 * 100
         print(f"  {g:>5}  {pk:>6.0f}  {adc:>4.0f}%  {dec:>7}")
-        
-        if adc > 95:
-            continue
         if dec > 0:
             candidates.append(g)
-            
+
     if candidates:
         best = max(candidates)
-        print(f"[*] Calibration complete. Settling on best RX Gain: {best} dB\n")
+        print(f"[*] Calibration complete. Best RX Gain: {best} dB\n")
         sdr.rx_hardwaregain_chan0 = best
     else:
-        print("[!] Calibration failed to find a working gain. Falling back to default.")
-        sdr.rx_hardwaregain_chan0 = args.rx_gain
+        best = max(good_gains, key=lambda x: x[0])[0]
+        print(f"[!] No packets decoded during calibration. Trying highest usable gain: {best} dB")
+        sdr.rx_hardwaregain_chan0 = best
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  PLUTO SETUP & MAIN
@@ -393,6 +430,22 @@ def setup_pluto():
     sdr.tx_hardwaregain_chan0   = int(args.tx_atten)
     sdr.tx_cyclic_buffer  = False
     sdr.rx_buffer_size    = 262144 * 2
+
+    # Disable the onboard DDS tone — otherwise it leaks into TX and corrupts the signal.
+    try:
+        import iio
+        dds = iio.Context(args.ip).find_device("cf-ad9361-dds-core-lpc")
+        if dds:
+            for ch in dds.channels:
+                if ch.output:
+                    for attr in ["raw", "scale"]:
+                        try:
+                            ch.attrs[attr].value = "0" if attr == "raw" else "0.0"
+                        except Exception:
+                            pass
+    except Exception:
+        pass
+
     print(f"[✓] Connected. Carrier {args.freq/1e6:.3f} MHz, 16QAM STABLE, SPS={args.sps}")
     return sdr
 
@@ -452,8 +505,12 @@ def receiver_main(sdr):
         
     print("[*] Starting ffplay for live video playback ...")
     ffplay_cmd = [
-        'ffplay', '-hide_banner', '-loglevel', 'error', '-f', 'mpegts',
-        '-fflags', 'nobuffer', '-flags', 'low_delay', '-strict', 'experimental', '-i', '-'
+        'ffplay', '-hide_banner', '-loglevel', 'error',
+        '-f', 'mpegts',
+        '-probesize', '32',       # start with minimal probe data
+        '-analyzeduration', '0',  # no analysis wait
+        '-framedrop',             # drop late frames to keep sync
+        '-i', '-'
     ]
     p = subprocess.Popen(ffplay_cmd, stdin=subprocess.PIPE)
     print("[RX] Listening for 16QAM STABLE stream... (Ctrl+C to stop)")
@@ -468,10 +525,13 @@ def receiver_main(sdr):
     try:
         with open("live_video_stable.ts", "wb") as f_out:
             while True:
-                try: raw = sdr.rx()
+                # Debug print to prove loop is running
+                print("[RX] Requesting buffer from SDR...", flush=True)
+                try: 
+                    raw = sdr.rx()
+                    print(f"[RX] Got buffer! Size: {len(raw)}", flush=True)
                 except OSError as e: 
-                    sys.stdout.write(f"\r[RX] SDR Buffer Timeout! ({e}) Retrying...   ")
-                    sys.stdout.flush()
+                    print(f"[RX] SDR Buffer Timeout! ({e}) Retrying...", flush=True)
                     continue
                 packets = iq_to_packets(raw)
                 for pkt in packets:
@@ -494,13 +554,11 @@ def receiver_main(sdr):
                     elapsed = time.time() - start_time
                     kbps = (bytes_rx * 8 / 1000) / max(elapsed, 0.1)
                     err_rate = (crc_fails / max(pkts_rx, 1)) * 100
-                    sys.stdout.write(f"\r[RX] Rcvd: {pkts_rx} pkts | Data: {bytes_rx/1e6:.2f} MB | {kbps:.1f} kbps | Bit-Errors: {err_rate:.1f}%   ")
-                    sys.stdout.flush()
+                    print(f"[RX] Rcvd: {pkts_rx} pkts | Data: {bytes_rx/1e6:.2f} MB | {kbps:.1f} kbps | Bit-Errors: {err_rate:.1f}%", flush=True)
                 else:
                     # Heartbeat so the user knows it's alive and listening to RF
                     peak = np.max(np.abs(raw))
-                    sys.stdout.write(f"\r[RX] Listening... (Raw RF Peak: {peak:.0f}/2048) | No packets decoded yet.   ")
-                    sys.stdout.flush()
+                    print(f"[RX] Listening... (Raw RF Peak: {peak:.0f}/2048) | No packets decoded yet.", flush=True)
     except KeyboardInterrupt:
         print("\n[RX] Interrupted.")
     finally:
