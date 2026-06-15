@@ -81,7 +81,7 @@ def rrcosfilter(N, alpha, Ts, Fs):
             h_rrc[x] = (np.sin(np.pi * t * (1 - alpha) / Ts) + 4 * alpha * (t / Ts) * np.cos(np.pi * t * (1 + alpha) / Ts)) / (np.pi * t / Ts * (1 - (4 * alpha * t / Ts)**2))
     return (h_rrc / np.sqrt(np.sum(h_rrc**2))).astype(np.float32)
 
-FILT = rrcosfilter(SAMPLES_PER_SYMBOL * 4 + 1, 0.35, 1, SAMPLES_PER_SYMBOL)
+FILT = rrcosfilter(SAMPLES_PER_SYMBOL * 12 + 1, 0.35, 1, SAMPLES_PER_SYMBOL)
 
 # 16QAM Gray Map
 _GRAY_MAP = {(0,0): -3, (0,1): -1, (1,1): +1, (1,0): +3}
@@ -469,7 +469,10 @@ def receiver_main(sdr):
         with open("live_video_stable.ts", "wb") as f_out:
             while True:
                 try: raw = sdr.rx()
-                except OSError: continue
+                except OSError as e: 
+                    sys.stdout.write(f"\r[RX] SDR Buffer Timeout! ({e}) Retrying...   ")
+                    sys.stdout.flush()
+                    continue
                 packets = iq_to_packets(raw)
                 for pkt in packets:
                     seq = pkt['seq']
@@ -492,6 +495,11 @@ def receiver_main(sdr):
                     kbps = (bytes_rx * 8 / 1000) / max(elapsed, 0.1)
                     err_rate = (crc_fails / max(pkts_rx, 1)) * 100
                     sys.stdout.write(f"\r[RX] Rcvd: {pkts_rx} pkts | Data: {bytes_rx/1e6:.2f} MB | {kbps:.1f} kbps | Bit-Errors: {err_rate:.1f}%   ")
+                    sys.stdout.flush()
+                else:
+                    # Heartbeat so the user knows it's alive and listening to RF
+                    peak = np.max(np.abs(raw))
+                    sys.stdout.write(f"\r[RX] Listening... (Raw RF Peak: {peak:.0f}/2048) | No packets decoded yet.   ")
                     sys.stdout.flush()
     except KeyboardInterrupt:
         print("\n[RX] Interrupted.")
