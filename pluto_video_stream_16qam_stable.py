@@ -38,7 +38,7 @@ ap.add_argument('--freq',      type=float, default=2412e6, help='carrier frequen
 ap.add_argument('--input',     type=str,   default=None, help='tx: input video file or /dev/video0')
 ap.add_argument('--bitrate',   type=str,   default='120k', help='tx: video bitrate (e.g. 120k)')
 ap.add_argument('--sps',       type=int,   default=16, help='samples per symbol')
-ap.add_argument('--chunk',     type=int,   default=512, help='bytes per packet')
+ap.add_argument('--chunk',     type=int,   default=376, help='bytes per packet (default 376 = 188×2, MPEG-TS aligned)')
 ap.add_argument('--rx-gain',   type=int,   default=40, help='RX hardware gain (used if --skip-cal)')
 ap.add_argument('--tx-atten',  type=int,   default=-20, help='TX hardware attenuation')
 ap.add_argument('--skip-cal',  action='store_true', help='rx: skip auto-calibration')
@@ -429,7 +429,7 @@ def setup_pluto():
     sdr.rx_hardwaregain_chan0   = int(args.rx_gain)
     sdr.tx_hardwaregain_chan0   = int(args.tx_atten)
     sdr.tx_cyclic_buffer  = False
-    sdr.rx_buffer_size    = 262144 * 2
+    sdr.rx_buffer_size    = 65536 * 2   # 131072 samples = 0.131s; smaller buffers → smaller gaps
 
     # Disable the onboard DDS tone — otherwise it leaks into TX and corrupts the signal.
     try:
@@ -465,6 +465,7 @@ def sender_main(sdr):
         
     ffmpeg_cmd += [
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
+        '-g', '30',           # I-frame every 30 frames (~1s) — decoder recovers from drops within 1s
         '-b:v', args.bitrate, '-maxrate', args.bitrate,
         '-bufsize', str(int(args.bitrate.replace('k','')) * 2) + 'k',
         '-f', 'mpegts', '-'
