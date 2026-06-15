@@ -333,6 +333,51 @@ def self_test():
         sys.exit(1)
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  AUTO-CALIBRATION
+# ═══════════════════════════════════════════════════════════════════════════════
+def auto_calibrate_rx(sdr):
+    print("\n[*] Starting RX Auto-Calibration ...")
+    print("    (Make sure the TX side is already running and streaming video)")
+    print(f"  {'Gain':>5}  {'Peak':>6}  {'ADC%':>5}  {'Decodes':>7}")
+    candidates = []
+    
+    for g in range(0, 75, 5):
+        if g > 71: g = 71
+        try: sdr.rx_hardwaregain_chan0 = g
+        except OSError: continue
+            
+        for _ in range(2): 
+            try: sdr.rx() 
+            except: pass
+            
+        pk = 0
+        dec = 0
+        for _ in range(3):
+            try:
+                rx = sdr.rx()
+                pk = max(pk, np.max(np.abs(rx)))
+                if len(iq_to_packets(rx)) > 0:
+                    dec += 1
+            except:
+                pass
+                
+        adc = pk / 2896 * 100
+        print(f"  {g:>5}  {pk:>6.0f}  {adc:>4.0f}%  {dec:>7}")
+        
+        if adc > 95:
+            continue
+        if dec > 0:
+            candidates.append(g)
+            
+    if candidates:
+        best = max(candidates)
+        print(f"[*] Calibration complete. Settling on best RX Gain: {best} dB\n")
+        sdr.rx_hardwaregain_chan0 = best
+    else:
+        print("[!] Calibration failed to find a working gain. Falling back to default.")
+        sdr.rx_hardwaregain_chan0 = args.rx_gain
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  PLUTO SETUP & MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 def setup_pluto():
@@ -360,6 +405,8 @@ def sender_main(sdr):
     ffmpeg_cmd = ['ffmpeg', '-hide_banner', '-loglevel', 'error']
     if args.input.startswith('/dev/video'):
         ffmpeg_cmd += ['-f', 'v4l2', '-i', args.input]
+    elif args.input.startswith('video='):
+        ffmpeg_cmd += ['-f', 'dshow', '-i', args.input]
     else:
         ffmpeg_cmd += ['-re', '-i', args.input]
         
@@ -379,7 +426,9 @@ def sender_main(sdr):
     try:
         while True:
             payload = p.stdout.read(CHUNK_BYTES)
-            if not payload: break
+            if not payload:
+                print("\n[TX] End of video stream.")
+                break
             seq += 1
             total_bytes += len(payload)
             pkt_bytes = build_packet(seq, payload)
@@ -398,6 +447,9 @@ def sender_main(sdr):
         except: pass
 
 def receiver_main(sdr):
+    if not args.skip_cal:
+        auto_calibrate_rx(sdr)
+        
     print("[*] Starting ffplay for live video playback ...")
     ffplay_cmd = [
         'ffplay', '-hide_banner', '-loglevel', 'error', '-f', 'mpegts',
@@ -405,6 +457,7 @@ def receiver_main(sdr):
     ]
     p = subprocess.Popen(ffplay_cmd, stdin=subprocess.PIPE)
     print("[RX] Listening for 16QAM STABLE stream... (Ctrl+C to stop)")
+    print("[RX] ALSO saving stream to 'live_video_stable.ts' in this folder!")
     
     pkts_rx = 0
     bytes_rx = 0
@@ -443,6 +496,7 @@ def receiver_main(sdr):
     except KeyboardInterrupt:
         print("\n[RX] Interrupted.")
     finally:
+        print("\n[RX] Saved video to live_video_stable.ts")
         p.stdin.close()
         p.kill()
 
