@@ -143,6 +143,37 @@ Calibration result from first real-hardware run (2026-06-15):
 
 To skip calibration after first run: `--skip-cal --rx-gain 45`
 
+> The above (RX-only, TX must already be transmitting at a fixed `--tx-atten`) is what
+> `pluto_video_stream_16qam_stable.py` does. For bringing the link up **on air**, where the
+> TX power also has to be negotiated, use `pluto_video_stream_16qam_stable_auto.py` (below).
+
+### `pluto_video_stream_16qam_stable_auto.py` — over-the-air TX↔RX auto-calibration
+
+Same DSP/streaming as the stable file, but a half-duplex handshake runs on the streaming
+frequency **before** streaming, negotiating *both* RX gain and TX power so neither needs
+hand-tuning on air. The video stream stays simplex (TX→RX); the reverse channel (RX→TX) is
+used **only** during the handshake for acknowledgements.
+
+- **Phase A (RX gain)**: TX beacons `CAL_TONE` at a fixed weak cal power (`CAL_TX_ATTEN=-30`
+  dB); RX sweeps gain 0→71 to decode the beacon, locks the best non-clipping gain, then
+  reports `CAL_GAIN_OK`.
+- **Phase B (TX power)**: TX sweeps attenuation weak→strong (`-40..0` dB), sending `CAL_PWR`
+  probes that carry the current atten; RX (at locked gain) echoes the first probe it decodes;
+  TX locks that atten `+ CAL_PWR_MARGIN(5)` dB for headroom.
+- **Phase C (READY)**: bidirectional `CAL_READY` handshake, then both sides drop into
+  one-way streaming.
+
+Control frames reuse the normal packet path; the control type is encoded in the high `seq`
+range (`CTRL_SEQ_BASE=0xCA000000`) so it never collides with video seqs (which count from 1).
+Beacons are sent as repeated **non-cyclic** bursts (no TX-buffer mode switch vs streaming),
+with small random hold jitter to break the half-duplex lock-step hazard. RX uses
+`CAL_ACK_ATTEN=-10` dB for its handshake acks (reverse link is uncalibrated → fairly strong).
+
+Run both sides within ~30 s of each other. `--skip-cal --rx-gain N --tx-atten N` bypasses the
+handshake on both roles. Offline-verified: self-test PASS, and all 4 control frames round-trip
+through a noisy channel (incl. the PWR value) with no cross-type false matches. **On-air
+handshake not yet hardware-tested.**
+
 ---
 
 ## Bugs Found and Fixed (2026-06-15 debug session)
