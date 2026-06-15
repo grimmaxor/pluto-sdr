@@ -101,15 +101,19 @@ def bits_to_symbols(bits):
 
 
 def symbols_to_bits(syms):
+    # Gray demap, allocation-light (called ~10k×/buffer in the RX hot loop).
+    # Per axis the four levels are -3,-1,+1,+3 → msb = (axis>0), lsb = inner
+    # point (|level|==1 ⇔ |axis|<2 in nominal units). Bit order per symbol:
+    # [I_msb, I_lsb, Q_msb, Q_lsb] — identical to the old round/clip/stack form.
     s = syms * np.sqrt(10)
-    def demap_axis(v):
-        lv = np.clip(np.round((v + 3) / 2).astype(int) * 2 - 3, -3, 3)
-        msb = (lv > 0).astype(np.uint8)
-        lsb = (np.abs(lv) == 1).astype(np.uint8)
-        return np.stack([msb, lsb], axis=1)
-    bi = demap_axis(s.real)
-    bq = demap_axis(s.imag)
-    return np.column_stack([bi[:, 0], bi[:, 1], bq[:, 0], bq[:, 1]]).reshape(-1)
+    sr = s.real
+    si = s.imag
+    out = np.empty(len(syms) * 4, dtype=np.uint8)
+    out[0::4] = sr > 0
+    out[1::4] = np.abs(sr) < 2.0
+    out[2::4] = si > 0
+    out[3::4] = np.abs(si) < 2.0
+    return out
 
 
 # ─── PACKET FRAMING ───────────────────────────────────────────────────────────
@@ -212,14 +216,30 @@ def iq_to_packets(iq):
     THR = PREAMBLE_LEN * 0.60
     preamble_c64 = PREAMBLE_SIGNS.astype(np.complex64)
 
+    # Position-dedup: RRC shaping makes a packet correlate at *every* SPS timing
+    # phase, so the same physical packet shows up as a candidate at all 16 toffs
+    # (and again in each CFO variant).  Once one of those decodes with CRC-OK we
+    # record its absolute preamble sample position; every later candidate landing
+    # within ~1 symbol of it is the same packet and is skipped — this removes the
+    # ~16× redundant symbols_to_bits/RS-decode work that dominated the profile.
+    covered = []                       # absolute sample positions already CRC-OK
+    cov_tol = SAMPLES_PER_SYMBOL + 2
+    def is_covered(abs_pos):
+        for p in covered:
+            if abs(abs_pos - p) <= cov_tol:
+                return True
+        return False
+
     for corrected_iq in _cfo_variants(iq):
         filt = oaconvolve(corrected_iq, FILT.astype(np.complex64),
                           mode='full')[:len(corrected_iq)].astype(np.complex64)
 
-        # Try all SPS timing phases.  With RRC filtering every phase gives a
-        # similar correlation peak, so we cannot reliably pick just one.
-        # Exact-length decode (below) keeps the per-candidate work bounded.
-        for toff in range(SAMPLES_PER_SYMBOL):
+        # Sample timing phases in steps of 4.  RRC shaping makes adjacent phases
+        # nearly identical, and the ±2 slip search below tiles the gaps, so the
+        # four sampled phases {0,4,8,12} with slips {0,±1,±2} cover all 16 phases
+        # — at a quarter of the per-toff correlation/fast-abort cost.  Sampling
+        # every phase was ~6× over the real-time buffer budget; this is under it.
+        for toff in range(0, SAMPLES_PER_SYMBOL, max(1, SAMPLES_PER_SYMBOL // 4)):
             stream = filt[delay + toff :: SAMPLES_PER_SYMBOL]
             if len(stream) < PREAMBLE_LEN + 32:
                 continue
@@ -233,6 +253,12 @@ def iq_to_packets(iq):
             cand, _ = find_peaks(mag, height=THR, distance=PREAMBLE_LEN // 2)
 
             for c in cand:
+                # Absolute sample position of this candidate's preamble.  Same
+                # for the same packet across all toffs and CFO variants → dedup.
+                abs_pos = delay + toff + int(c) * SAMPLES_PER_SYMBOL
+                if is_covered(abs_pos):
+                    continue
+
                 phi       = np.angle(corr[c])
                 derot     = np.exp(-1j * phi)
                 chan_gain = mag[c] / PREAMBLE_LEN
@@ -299,6 +325,11 @@ def iq_to_packets(iq):
                         pkt['crc_ok'] = crc_ok
                         if seq not in found or (crc_ok and not found[seq]['crc_ok']):
                             found[seq] = pkt
+                        if crc_ok:
+                            # Clean decode — mark this packet's position covered
+                            # and stop probing other slips/toffs/variants for it.
+                            covered.append(abs_pos)
+                            break   # next candidate; no need to try more slips
 
     return [found[k] for k in sorted(found.keys())]
 
@@ -515,30 +546,35 @@ def receiver_main(sdr):
         '-i', '-'
     ]
     p = subprocess.Popen(ffplay_cmd, stdin=subprocess.PIPE)
+    # Save each session to a date/time-stamped file so runs don't overwrite each other.
+    out_name = time.strftime("live_video_stable_%Y%m%d_%H%M%S.ts")
     print("[RX] Listening for 16QAM STABLE stream... (Ctrl+C to stop)")
-    print("[RX] ALSO saving stream to 'live_video_stable.ts' in this folder!")
-    
+    print(f"[RX] ALSO saving stream to '{out_name}' in this folder!")
+
     pkts_rx = 0
     bytes_rx = 0
     crc_fails = 0
     last_seq = -1
     start_time = time.time()
-    
+
     try:
-        with open("live_video_stable.ts", "wb") as f_out:
+        with open(out_name, "wb") as f_out:
             while True:
-                # Debug print to prove loop is running
-                print("[RX] Requesting buffer from SDR...", flush=True)
-                try: 
+                try:
                     raw = sdr.rx()
-                    print(f"[RX] Got buffer! Size: {len(raw)}", flush=True)
-                except OSError as e: 
+                except OSError as e:
                     print(f"[RX] SDR Buffer Timeout! ({e}) Retrying...", flush=True)
                     continue
                 packets = iq_to_packets(raw)
                 for pkt in packets:
                     seq = pkt['seq']
                     payload = pkt['payload']
+                    # The 7-byte header (MAGIC,seq,plen) is NOT RS-protected, so a
+                    # bit-flip in seq yields a CRC-valid packet with a garbage
+                    # sequence number (the 67093257-style "Lost" spikes).  Reject
+                    # an implausible forward jump so it can't poison last_seq.
+                    if last_seq != -1 and (seq - last_seq) > 100000:
+                        continue
                     if not pkt.get('crc_ok', True): crc_fails += 1
                     if last_seq != -1 and seq > last_seq + 1:
                         lost = seq - last_seq - 1
