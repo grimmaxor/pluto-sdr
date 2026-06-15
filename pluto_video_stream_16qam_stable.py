@@ -465,7 +465,8 @@ def sender_main(sdr):
         
     ffmpeg_cmd += [
         '-c:v', 'libx264', '-preset', 'ultrafast', '-tune', 'zerolatency',
-        '-g', '30',           # I-frame every 30 frames (~1s) — decoder recovers from drops within 1s
+        '-g', '30',                          # IDR every 30 frames (~1s)
+        '-x264-params', 'repeat-headers=1', # SPS+PPS before every IDR — decoder can resync mid-stream
         '-b:v', args.bitrate, '-maxrate', args.bitrate,
         '-bufsize', str(int(args.bitrate.replace('k','')) * 2) + 'k',
         '-f', 'mpegts', '-'
@@ -506,7 +507,7 @@ def receiver_main(sdr):
         
     print("[*] Starting ffplay for live video playback ...")
     ffplay_cmd = [
-        'ffplay', '-hide_banner', '-loglevel', 'error',
+        'ffplay', '-hide_banner', '-loglevel', 'fatal',  # suppress h264 PPS noise
         '-f', 'mpegts',
         '-probesize', '32',       # start with minimal probe data
         '-analyzeduration', '0',  # no analysis wait
