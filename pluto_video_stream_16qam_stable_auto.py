@@ -424,18 +424,48 @@ def _cal_match(pkt, want_type):
     pl = pkt['payload']
     return struct.unpack('>h', pl[:2])[0] if len(pl) >= 2 else 0
 
+def _cal_enter_tx_mode(sdr):
+    """Switch the TX to a cyclic buffer for the calibration handshake."""
+    try: sdr.tx_destroy_buffer()
+    except Exception: pass
+    sdr.tx_cyclic_buffer = True
+
+def _cal_exit_tx_mode(sdr):
+    """Restore the non-cyclic TX buffer used for video streaming."""
+    try: sdr.tx_destroy_buffer()
+    except Exception: pass
+    sdr.tx_cyclic_buffer = False
+
 def _cal_tx(sdr, ctrl_type, value=0, hold=1.2):
-    """Beacon a control frame as repeated non-cyclic bursts for `hold` seconds."""
+    """Beacon a control frame for `hold` seconds via the cyclic TX buffer.
+
+    Uses a CYCLIC buffer (loaded once, auto-repeats) instead of hammering
+    sdr.tx() in a busy loop — the latter could raise a transient EBUSY on real
+    hardware and silently cut the beacon short.  Mirrors pluto_filelink_auto.py.
+    Requires _cal_enter_tx_mode(sdr) to have been called first.
+    """
     iq = packet_to_iq(_cal_build(ctrl_type, value))
-    t_end = time.time() + hold + random.uniform(0, 0.2)   # jitter breaks lock-step
-    while time.time() < t_end:
-        try:
-            sdr.tx(iq)
-        except Exception:
-            break
+    try: sdr.tx_destroy_buffer()
+    except Exception: pass
+    try:
+        sdr.tx(iq)                                       # cyclic → loops itself
+    except Exception:
+        pass
+    time.sleep(hold + random.uniform(0, 0.2))            # jitter breaks lock-step
+
+_CAL_SILENCE = np.zeros(4096, dtype=np.complex64)
 
 def _cal_listen(sdr, want_type, timeout=1.5):
-    """Listen up to `timeout` s for a control frame of want_type; return its value."""
+    """Listen up to `timeout` s for a control frame of want_type; return its value.
+
+    Loads a cyclic silence buffer first so our own last beacon isn't still
+    looping into our RX while we listen (the TX cyclic buffer keeps running until
+    replaced) — same silence-then-listen pattern as pluto_filelink_auto.py.
+    """
+    try: sdr.tx_destroy_buffer()
+    except Exception: pass
+    try: sdr.tx(_CAL_SILENCE)
+    except Exception: pass
     for _ in range(2):                         # flush stale buffers
         try: sdr.rx()
         except Exception: pass
@@ -498,6 +528,8 @@ def calibrate_tx(sdr):
     print("  TX — over-the-air auto-calibration")
     print("=" * 54)
 
+    _cal_enter_tx_mode(sdr)
+
     # Phase A: beacon at a fixed cal power so the RX can sweep & lock its gain.
     print(f"\n[TX] Phase A: beaconing at {CAL_TX_ATTEN} dB so RX can set its gain.")
     sdr.tx_hardwaregain_chan0 = CAL_TX_ATTEN
@@ -537,8 +569,8 @@ def calibrate_tx(sdr):
         if _cal_listen(sdr, CAL_READY, timeout=1.2) is not None:
             print("[TX] ✓ Link confirmed both ways!")
             break
-    try: sdr.tx_destroy_buffer()
-    except Exception: pass
+    _cal_exit_tx_mode(sdr)
+    sdr.tx_hardwaregain_chan0 = chosen          # re-apply (destroy may reset path)
     print(f"\n[TX] Calibration done: TX atten {chosen} dB\n")
     return chosen
 
@@ -551,6 +583,7 @@ def calibrate_rx(sdr):
     # Phase A: sweep our RX gain against the TX beacon, then report GAIN_OK.
     best = _sweep_rx_gain_beacon(sdr)
     sdr.rx_hardwaregain_chan0 = best
+    _cal_enter_tx_mode(sdr)
     sdr.tx_hardwaregain_chan0 = CAL_ACK_ATTEN
     print("[RX] Reporting gain lock until TX starts power negotiation ...")
     t_end = time.time() + 40
@@ -576,8 +609,7 @@ def calibrate_rx(sdr):
             _cal_tx(sdr, CAL_READY, hold=1.0)
             print("[RX] ✓ Link confirmed!")
             break
-    try: sdr.tx_destroy_buffer()
-    except Exception: pass
+    _cal_exit_tx_mode(sdr)
     sdr.rx_hardwaregain_chan0 = best
     print(f"\n[RX] Calibration done: RX gain {best} dB\n")
     return best
